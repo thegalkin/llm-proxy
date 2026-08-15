@@ -1,0 +1,39 @@
+[Unit]
+Description=llm-proxy — Multi-provider LLM reverse proxy with YAML routing table
+After=network-online.target
+
+[Service]
+Type=simple
+# Repo + binary live at ~/github/llm-proxy. Keys live in
+# ~/.config/opencode/quota-state/secrets/minimax-proxy.env (a 0600 file,
+# excluded from Syncthing via .stignore). The repo ships a symlink at
+# ~/github/llm-proxy/.env → that secrets file so manual `./llm-proxy`
+# from the repo dir also works. Source of truth for the keys is
+# ~/.local/share/opencode/auth.json under "minimax" and "minimax-coding-plan".
+# Routing table is at ~/.config/llm-proxy/config.yaml.
+WorkingDirectory=%h/github/llm-proxy
+EnvironmentFile=%h/.config/opencode/quota-state/secrets/minimax-proxy.env
+EnvironmentFile=%h/.config/opencode/quota-state/secrets/llm-proxy.env
+ExecStart=%h/github/llm-proxy/run.sh
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/github/llm-proxy
+ReadWritePaths=%h/.config/opencode/quota-state/secrets
+ReadWritePaths=%h/.config/llm-proxy
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=default.target
