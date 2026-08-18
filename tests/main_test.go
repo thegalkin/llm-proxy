@@ -19,35 +19,7 @@ func loadTestConfig(t *testing.T) *proxy.Config {
 	return &c
 }
 
-func TestRoutingPriority_MinimaxMatch(t *testing.T) {
-	c := loadTestConfig(t)
-	cases := []struct {
-		name      string
-		key       string
-		wantType  string
-		wantModel string
-	}{
-		{"opencode-go/minimax-m3", "opencode-go/minimax-m3", "minimax", "MiniMax-m3"},
-		{"opencode-go/minimax-m2.7", "opencode-go/minimax-m2.7", "minimax", "MiniMax-m2.7"},
-		{"opencode-go/minimax-m2.5", "opencode-go/minimax-m2.5", "minimax", "MiniMax-m2.5"},
-		{"opencode-zen/minimax-m3", "opencode-zen/minimax-m3", "minimax", "MiniMax-m3"},
-		{"opencode-zen/minimax-m2.7", "opencode-zen/minimax-m2.7", "minimax", "MiniMax-m2.7"},
-		{"opencode-go/minimax (bare)", "opencode-go/minimax", "minimax", "MiniMax"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			us := c.ResolveRule(tc.key)
-			if us.Type != tc.wantType {
-				t.Errorf("type = %q, want %q (ruleName=%s)", us.Type, tc.wantType, us.BaseURL)
-			}
-			if us.Model != tc.wantModel {
-				t.Errorf("model = %q, want %q", us.Model, tc.wantModel)
-			}
-		})
-	}
-}
-
-func TestRoutingPriority_OpencodeGoNonMinimax(t *testing.T) {
+func TestRoutingPriority_OpencodeGo(t *testing.T) {
 	c := loadTestConfig(t)
 	cases := []struct {
 		name string
@@ -75,24 +47,12 @@ func TestRoutingPriority_OpencodeGoNonMinimax(t *testing.T) {
 	}
 }
 
-func TestRoutingPriority_MinimaxShadowedByP0(t *testing.T) {
-	c := loadTestConfig(t)
-	us := c.ResolveRule("opencode-go/minimax-future-variant")
-	if us.Type != "minimax" {
-		t.Errorf("P0 should win: type = %q, want minimax", us.Type)
-	}
-	if us.Model != "MiniMax-future-variant" {
-		t.Errorf("wildcard preserve: model = %q, want MiniMax-future-variant", us.Model)
-	}
-}
-
 func TestRoutingPriority_CatchAll(t *testing.T) {
 	c := loadTestConfig(t)
 	cases := []string{
 		"random/anything",
 		"anthropic/claude-3",
 		"openai/gpt-4",
-		"minimax/MiniMax-M3", // default rule routes it to the minimax family
 	}
 	for _, key := range cases {
 		t.Run(key, func(t *testing.T) {
@@ -100,13 +60,6 @@ func TestRoutingPriority_CatchAll(t *testing.T) {
 			wantType := "opencode-go"
 			wantModel := "deepseek-v4-flash"
 			wantEff := "max"
-			if key == "minimax/MiniMax-M3" {
-				// The built-in default rule routes bare MiniMax models to the
-				// minimax family, preserving the canonical model name.
-				wantType = "minimax"
-				wantModel = "MiniMax-M3"
-				wantEff = ""
-			}
 			if us.Type != wantType {
 				t.Errorf("catch-all: type = %q, want %q", us.Type, wantType)
 			}
@@ -122,8 +75,8 @@ func TestRoutingPriority_CatchAll(t *testing.T) {
 
 func TestRoutingPriority_Order(t *testing.T) {
 	c := loadTestConfig(t)
-	if c.Rules[0].MatchExpr != "opencode-go/minimax*" {
-		t.Errorf("rule[0] = %q, want opencode-go/minimax*", c.Rules[0].MatchExpr)
+	if c.Rules[0].MatchExpr != "opencode-go/*" {
+		t.Errorf("rule[0] = %q, want opencode-go/*", c.Rules[0].MatchExpr)
 	}
 	if c.Rules[len(c.Rules)-1].MatchExpr != "*" {
 		t.Errorf("catch-all rule = %q, want *", c.Rules[len(c.Rules)-1].MatchExpr)
@@ -160,12 +113,8 @@ func TestDecideKeyNoDuplicatePrefix(t *testing.T) {
 		wantType     string
 		wantModel    string
 	}{
-		{"client-prefixed minimax", `{"model":"opencode-go/minimax-m3","messages":[]}`, "opencode-go", "minimax", "MiniMax-m3"},
 		{"client-prefixed kimi", `{"model":"opencode-go/kimi-k3","messages":[]}`, "opencode-go", "opencode-go", "deepseek-v4-flash"},
 		{"bare model gets prefix", `{"model":"kimi-k3","messages":[]}`, "opencode-go", "opencode-go", "deepseek-v4-flash"},
-		// The built-in default rule routes bare MiniMax models on the messages
-		// path to the minimax family (previously fell through to the catch-all).
-		{"bare minimax on messages path", `{"model":"MiniMax-M3","messages":[]}`, "minimax", "minimax", "MiniMax-M3"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -191,7 +140,6 @@ func TestJoinTarget(t *testing.T) {
 		{"clean-pattern", "https://opencode.ai/zen/go/v1", "/chat/completions", "https://opencode.ai/zen/go/v1/chat/completions"},
 		{"trailing-slash-base", "https://opencode.ai/zen/go/v1/", "/chat/completions", "https://opencode.ai/zen/go/v1/chat/completions"},
 		{"no-pattern", "https://opencode.ai/zen/go/v1", "", "https://opencode.ai/zen/go/v1"},
-		{"minimax-full-url", "https://api.minimax.io/anthropic/v1/messages", "", "https://api.minimax.io/anthropic/v1/messages"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -204,15 +152,12 @@ func TestJoinTarget(t *testing.T) {
 
 func TestRoutingTargetURL(t *testing.T) {
 	c := loadTestConfig(t)
-	minimaxURL := "https://api.minimax.io/anthropic/v1/messages"
 	opencodeGoURL := "https://opencode.ai/zen/go/v1/chat/completions"
 	cases := []struct {
 		name string
 		key  string
 		want string
 	}{
-		{"go-minimax-m3", "opencode-go/minimax-m3", minimaxURL},
-		{"zen-minimax-m2.7", "opencode-zen/minimax-m2.7", minimaxURL},
 		{"go-kimi", "opencode-go/kimi-k3", opencodeGoURL},
 		{"zen-glm", "opencode-zen/glm-5.1", opencodeGoURL},
 		{"catch-all", "random/anything", opencodeGoURL},
@@ -220,12 +165,7 @@ func TestRoutingTargetURL(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			us := c.ResolveRule(tc.key)
-			var got string
-			if us.Type == "minimax" {
-				got = us.BaseURL
-			} else {
-				got = proxy.JoinTarget(us.BaseURL, us.URLPattern)
-			}
+			got := proxy.JoinTarget(us.BaseURL, us.URLPattern)
 			if got != tc.want {
 				t.Errorf("rule %q -> target %q, want %q (type=%s)", tc.key, got, tc.want, us.Type)
 			}
@@ -243,14 +183,6 @@ default_url_pattern: /v1/chat/completions
 default_reasoning_effort: max
 
 rules:
-  - priority: 0
-    from: opencode-go/minimax*
-    to: minimax sub/minimax*
-
-  - priority: 0
-    from: opencode-zen/minimax*
-    to: minimax sub/minimax*
-
   - priority: 1
     from: opencode-go/*
     to: opencode-go/deepseek-v4-flash

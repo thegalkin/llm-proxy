@@ -1,231 +1,134 @@
-# minimax-proxy
+# llm-proxy
 
-Anthropic-compatible reverse proxy for [`api.minimax.io`](https://platform.minimax.io) — drop-in between [opencode](https://github.com/sst/opencode) (or any Anthropic SDK client) and the upstream API. Single static binary, zero external dependencies, ~430 lines of Go.
+Anthropic/OpenAI-compatible multi-provider reverse proxy for [opencode](https://github.com/sst/opencode) with a YAML routing table. Drop-in between opencode (or any Anthropic SDK client) and the upstream API. Single static binary, zero external dependencies.
+
+Routes requests by the body's `model` field (or request path), rewrites the model name to what the upstream actually serves, and forwards with per-provider key failover.
 
 ## Features
 
-- **Two-key provider failover.** Rotate between `MINIMAX_CODING_PLAN_KEY` and `MINIMAX_KEY` when the upstream returns HTTP 429 `type:"rate_limit_error"`. First non-rate-limit response wins; both exhausted → a final 429 to the client (so its own fallback chain can fire).
-- **SSE passthrough with per-event flushing.** Streaming responses are forwarded event-by-event as soon as the upstream emits them. No 16 KiB ReadFull wait.
-- **`/admin/limits` endpoint** for live quota inspection — see below.
-- **In-memory per-provider stats** — request counts by status class (2xx/429/other), failover-hit counter, and last-event timestamps, surfaced over `/admin/limits`.
+- **YAML routing table** at `~/.config/llm-proxy/config.yaml` — `from:` model pattern → `to:` upstream + canonical model name. Hot-reloadable via SIGHUP (not wired yet, but the loader re-runs cleanly).
+- **Built-in routing** that works out of the box with no config file:
+  - `GO/<model>` → opencode-go subscription (`https://opencode.ai/zen/go/v1`), model rewritten to `<name>` (e.g. `GO/deepseek-v4-flash` → `deepseek-v4-flash`).
+  - `opencode-zen/zen/<model>` → opencode-zen free tier (`https://opencode.ai/zen/v1`), model rewritten to the bare name.
+  - anything else → default upstream (opencode-go).
+- **Multi-key failover** for opencode-go: `OPENCODE_GO_KEY_1..16` are rotated on 401/403/429/400 and on transport errors/timeouts.
+- **SSE passthrough with per-event flushing** — streamed responses are forwarded event-by-event, no buffering.
+- **Response-header timeout** — the upstream is known to hang on large requests; without a bound the proxy hangs forever. Timeout is per-rule (`timeout_s`) or global (`default_timeout_s`), built-in default 120 s. SSE body streaming stays unbounded.
+- **Client-disconnect cancellation** — upstream requests are created with the client's context, so abandoning a request leaves no zombie upstream connection.
+- **Empty-assistant sanitizer** — drops assistant messages with an empty `content` array (the opencode-go upstream rejects them with 400).
+- **`/v1/models`** — model list for provider UIs.
+- **In-memory per-provider stats** — request counts by status class (2xx/429/other), failover-hit counter.
 
-## Endpoint: `GET /admin/limits`
+## Endpoints
 
-Designed for a CLI dashboard. For each provider it returns:
-
-1. **Live counters** (`requests_2xx`, `requests_429`, `requests_other`, `failover_hits`) updated atomically from the request path; resets to zero on proxy restart.
-2. **Quota snapshot** — the proxy issues `GET https://api.minimax.io/v1/token_plan/remains` for each key (CN mirror `api.minimaxi.com` if global returns 401/403), parses the `model_remains[]` entry for `model_name == "general"` and exposes both the 5-hour and weekly windows:
-   - `pct_remaining` — percent remaining (NOT consumed; MiniMax semantics — note this contradicts the literal field name, see [openclaw #86885](https://github.com/openclaw/openclaw/issues/86885))
-   - `total_count` / `remaining_count` / `consumed_count`
-   - `reset_in_s` — Unix seconds until reset
-   - `window_start_unix` / `window_end_unix` (Unix seconds)
-   - `status` — integer state (1 = active, 3 = exhausted)
-
-Sample response:
-
-```json
-{
-  "uptime_unix": 1784718940,
-  "providers": [
-    {
-      "provider": "minimax-coding-plan",
-      "stats": {
-        "requests_2xx": 1247,
-        "requests_429": 3,
-        "requests_other": 0,
-        "failover_hits": 3
-      },
-      "quota": {
-        "ok": true,
-        "source_url": "https://api.minimax.io/v1/token_plan/remains",
-        "five_h":   { "pct_remaining": 81, "total_count": 0, "remaining_count": 0, "consumed_count": 0, "reset_in_s": 13211, "status": 1, "window_start_unix": 1784714400, "window_end_unix": 1784732400 },
-        "weekly":   { "pct_remaining": 53, "total_count": 0, "remaining_count": 0, "consumed_count": 0, "reset_in_s": 391460, "status": 1, "window_start_unix": 1784505600, "window_end_unix": 1785110400 }
-      }
-    },
-    { "...": "second provider" }
-  ]
-}
-```
-
-## CLI companion
-
-Pair this with the [`oco`](https://github.com/sst/opencode) wrapper's `limits` subcommand (or use `curl + jq` directly):
-
-```
-$ oco limits
-minimax-proxy @ 127.0.0.1:8443
-  fetched: 2026-07-22T11:22:47Z
-
-provider minimax-coding-plan
-  stats:  2xx=1247  429=3  failover=3  other=0
-  source: https://api.minimax.io/v1/token_plan/remains
-  5h:     81% remaining  ████████████████░░░░  reset in 3h 39m
-  week:   53% remaining  ██████████░░░░░░░░░░  reset in 4d 12h
-
-provider minimax
-  stats:  2xx=0  429=0  failover=0  other=0
-  source: https://api.minimax.io/v1/token_plan/remains
-  5h:    100% remaining  ████████████████████  reset in 3h 39m
-  week:   96% remaining  ███████████████████░  reset in 4d 12h
-```
-
-Bars colorize green / yellow / red at the 10 % / 3 % thresholds. Pass `--json` for the raw endpoint output, or `--name <substring>` to filter to a single provider.
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/v1/messages` | POST | Anthropic-shape requests (opencode, Claude Code, etc.) |
+| `/v1/chat/completions` | POST | OpenAI-shape requests |
+| `/v1/models` | GET | Model list |
+| `/healthz` | GET | Liveness + rules/providers count |
 
 ## Install
 
 Requires Go 1.23+.
 
 ```sh
-git clone https://github.com/thegalkin/minimax-proxy.git
-cd minimax-proxy
-go build -trimpath -ldflags="-s -w" -o minimax-proxy .
+git clone https://github.com/thegalkin/llm-proxy.git
+cd llm-proxy
+go build -trimpath -ldflags="-s -w" -o llm-proxy ./cmd/llm-proxy
 cp .env.example .env
-$EDITOR .env                  # paste both keys (see below)
+$EDITOR .env                  # paste your keys (see below)
 chmod 600 .env                # required — proxy refuses startup if mode is wider
 
 # Run directly
-./minimax-proxy
+./llm-proxy
 
 # Or under systemd (user unit)
-cp minimax-proxy.service ~/.config/systemd/user/
+cp llm-proxy.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now minimax-proxy
+systemctl --user enable --now llm-proxy
 curl -s http://127.0.0.1:8443/healthz
 ```
 
-`.env` keys:
+`.env` keys (loaded by `run.sh` via `ENV_FILE=$DIR/.env`; `OPENCODE_GO_KEY_N` may also come from systemd `EnvironmentFile=`):
 
-| Variable | Required | Default | Effect |
-| --- | --- | --- | --- |
-| `MINIMAX_CODING_PLAN_KEY` | yes | — | Primary key, tried first |
-| `MINIMAX_KEY` | yes | — | Fallback key, tried on 429 + `rate_limit_error`. Must differ from the primary — the proxy refuses to start if both keys are identical |
-| `LISTEN_ADDR` | no | `127.0.0.1:8443` | Bind address |
+| Variable | Required | Effect |
+| --- | --- | --- |
+| `OPENCODE_GO_KEY_1..16` | yes (at least one) | opencode-go subscription keys, rotated on failure |
+| `OPENCODE_ZEN_KEY` | no | opencode-zen free-tier key (hides the Zen family if missing) |
+| `LISTEN_ADDR` | no, default `127.0.0.1:8443` | Bind address |
 
-## Where the keys come from
+## Routing config
 
-The keys live in **two** places and they must stay in sync:
+With no `~/.config/llm-proxy/config.yaml` the built-in table (see above) applies. To customize, create the file:
 
-1. **Source of truth** — `~/.local/share/opencode/auth.json`, under the
-   `"minimax"` and `"minimax-coding-plan"` keys. opencode stores them there
-   when you sign in to the platform; the `fetch-quotas.sh` cron job reads
-   them directly. They survive across reinstalls because opencode owns
-   this file.
-2. **Live config for the proxy** —
-   `~/.config/opencode/quota-state/secrets/minimax-proxy.env`, mode 0600.
-   The systemd unit points `EnvironmentFile=` at this path. The
-   `secrets/` directory is excluded from Syncthing via `.stignore`, so the
-   keys never leak to other machines.
+```yaml
+listen_addr: "127.0.0.1:8443"
+default_timeout_s: 120
+default_to: opencode-go/deepseek-v4-flash
+default_base_url: https://opencode.ai/zen/go/v1
+default_url_pattern: /v1/chat/completions
+default_reasoning_effort: max
 
-The repo ships a symlink `~/github/minimax-proxy/.env` → the secrets file,
-so running `./minimax-proxy` directly from the repo also works (it uses
-`ENV_FILE=$DIR/.env` from `run.sh`).
+rules:
+  - from: "GO/*"
+    to: "opencode-go/*"
+    priority: 10
 
-**To refresh the keys** (e.g. opencode was re-authenticated and got a new
-`auth.json`):
+  - from: "opencode-zen/zen/*"
+    to: "opencode-zen zen/*"
+    priority: 10
 
-```sh
-j=$(jq -r '.["minimax-coding-plan"].key' ~/.local/share/opencode/auth.json)
-k=$(jq -r '.minimax.key'                ~/.local/share/opencode/auth.json)
-install -m 600 /dev/null ~/.config/opencode/quota-state/secrets/minimax-proxy.env
-{
-  printf 'MINIMAX_CODING_PLAN_KEY=%s\nMINIMAX_KEY=%s\n' "$j" "$k"
-  [ -n "${LISTEN_ADDR:-}" ] && printf 'LISTEN_ADDR=%s\n' "$LISTEN_ADDR"
-} > ~/.config/opencode/quota-state/secrets/minimax-proxy.env
-systemctl --user restart minimax-proxy
+  - from: "custom/*"
+    to: "passthrough https://my-upstream.example.com/v1/chat/completions"
+    priority: 20
 ```
+
+`from:` supports a single `*` wildcard; the captured suffix is preserved in the rewritten model when `to:` ends with `*`. `to:` syntax is `<provider>/<model>` (or `<provider> <namespace>/<model>`), with optional `reasoning_effort: low|high|max`.
+
+Provider types: `opencode-go`, `opencode-zen`, `passthrough` (direct URL, auth passthrough, no model rewrite).
 
 ## Configure opencode
 
-Replace the `minimax` provider's `baseURL` so opencode talks to the proxy instead of the upstream directly:
+Point opencode's provider at the proxy:
 
 ```jsonc
 // ~/.config/opencode/opencode.json
 "provider": {
-  "minimax": {
+  "llm-proxy": {
     "npm": "@ai-sdk/anthropic",
-    "name": "MiniMax (via proxy)",
+    "name": "llm-proxy",
     "options": { "baseURL": "http://127.0.0.1:8443" },
-    "models": { /* unchanged */ }
+    "models": { /* as needed */ }
   }
 }
 ```
 
-The provider ID is `minimax` — the proxy is transparent about which key it uses, so no per-key wiring is needed.
-
-## Sounds (optional)
-
-`sounds/{en,ru}/limit_{5h,weekly}.wav` are pre-generated placeholder voice announcements (espeak-ng synthesised, mono 22050 Hz). They are NOT wired into the proxy itself — the proxy is silent.
-
-To opt into spoken alerts when the upstream quota drops below a threshold, run a sidecar that polls `/admin/limits` and plays these files. Example:
-
-```sh
-# 5-minute quota watcher: announce 5h window when it drops below 10 %
-while true; do
-  pct=$(curl -sf http://127.0.0.1:8443/admin/limits \
-        | jq '.providers[0].quota.five_h.pct_remaining')
-  if [ "$pct" -lt 10 ]; then
-    ffplay -autoexit -nodisp -loglevel error sounds/en/limit_5h.wav
-  fi
-  sleep 300
-done
-```
-
-Swap `sounds/en/` for `sounds/ru/` if you prefer the Russian voice, or record your own and overwrite the files in place.
-
-## Why this exists
-
-opencode's `fallback_models` chain doesn't fire on a `RateLimitError` from the MiniMax coding-plan endpoint — the runtime retries the same provider until its own `retry.maxDelayMs` ceiling aborts, and you see the `Retry Error` toast. This proxy sits between opencode and `api.minimax.io`, retries with a second key on HTTP 429 + `type:"rate_limit_error"`, and only returns the final response once one of the two keys succeeds.
+Models are addressed with their routing prefixes: `GO/deepseek-v4-flash`, `opencode-zen/zen/big-pickle`, etc. The proxy rewrites them to the canonical names upstream.
 
 ## Upstream timeouts and failover
 
-The opencode.ai upstream has been observed to hang for many minutes on large
-(~1 MB) requests. The proxy used to wait forever — opencode's client retried
-with an ever-growing body (the failed turn is re-sent with the error injected
-into the system prompt), burning input tokens on every attempt.
+The opencode.ai upstream has been observed to hang for many minutes on large (~1 MB) requests. The proxy now:
 
-The proxy now:
-
-- bounds the wait for upstream **response headers** (`timeout_s` per rule,
-  `default_timeout_s` at the top level, built-in default 120 s). SSE body
-  streaming itself stays unbounded;
-- **fails over to the next key** when an attempt times out or dies on a
-  transport error (previously only 401/403/429 triggered failover);
-- returns **504** to the client when all keys time out (429 is still used when
-  all keys answered 401/403/429);
-- **cancels the upstream request when the client disconnects** — upstream
-  requests are created with the client's context, so opencode abandoning a
-  request no longer leaves zombie upstream connections.
-
-## Built-in routing table
-
-With no `~/.config/llm-proxy/config.yaml` (or with no `rules:` in it) the
-proxy routes out of the box:
-
-| request model | upstream | model rewrite |
-| --- | --- | --- |
-| `GO/<name>` | opencode-go | `<name>` (e.g. `GO/deepseek-v4-flash` → `deepseek-v4-flash`) |
-| `opencode-zen/zen/<name>` | opencode-zen | `<name>` (the `zen/` label is routing-only; the API serves bare names) |
-| `MiniMax-*` (on `/v1/messages`) | minimax | canonical `MiniMax-<name>` |
-| anything else | default upstream (opencode-go) | — |
-
-Wildcard `to:` targets like `opencode-go/*` preserve the captured model name
-(the star capture previously rewrote the model to a literal `*`).
+- bounds the wait for upstream **response headers** (`timeout_s` per rule, `default_timeout_s` at the top level, built-in default 120 s). SSE body streaming stays unbounded;
+- **fails over to the next key** when an attempt times out or dies on a transport error (previously only 401/403/429 triggered failover);
+- returns **504** to the client when all keys time out (429 is still used when all keys answered 401/403/429);
+- **cancels the upstream request when the client disconnects** — upstream requests are created with the client's context, so opencode abandoning a request no longer leaves zombie upstream connections.
 
 ## Safety
 
 - `.env` is `chmod 600`; the proxy does not log its contents.
 - By default binds to `127.0.0.1` only — the bundled systemd unit sets `LISTEN_ADDR=127.0.0.1:8443`.
 - Upstream responses are passed through unchanged — status, headers, body.
-- The `/admin/*` endpoints are unauthenticated; if you widen `LISTEN_ADDR` beyond loopback, gate them at the network layer.
 
 ## Development
 
 Pre-commit expectations:
 
-- `go build .` exits 0 with no warnings.
-- `rg -n 'sk-cp-[A-Za-z0-9_-]{20,}' main.go .env.example` returns nothing.
-- `rg -n 'thegalkin|/var/home/thegalkin' main.go` returns nothing.
-- `ls sounds/*/limit_*.wav | wc -l` equals 4 (en/limit_5h, en/limit_weekly, ru/limit_5h, ru/limit_weekly).
+- `go build ./...` exits 0 with no warnings.
+- `go test ./...` is green.
+- `rg -n 'sk-cp-[A-Za-z0-9_-]{20,}' .env.example` returns nothing.
+- `rg -n 'thegalkin|/home/thegalkin' --glob '*.go'` returns nothing.
 
 ## License
 

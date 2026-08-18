@@ -36,15 +36,12 @@ func clientGone(r *http.Request) bool {
 	return r.Context().Err() != nil
 }
 
-// forward sends body to upstream.URL using upstream's auth. For type=minimax
-// it does the two-key failover dance from the legacy proxy. For type=
+// forward sends body to upstream.URL using upstream's auth. For type=
 // opencode-go it injects the Authorization header from the OPENCODE_GO_TOKEN
 // env var (optional). For type=passthrough it does simple POST with no auth.
 func forward(cfg *Config, w http.ResponseWriter, r *http.Request, body []byte, decision RoutingDecision, providers []Provider) {
 	us := decision.Upstream
 	switch us.Type {
-	case "minimax":
-		ForwardMinimax(w, r, body, us, providers)
 	case "opencode-go":
 		ForwardOpencodeGo(w, r, body, us, providers)
 	case "opencode-zen":
@@ -55,107 +52,6 @@ func forward(cfg *Config, w http.ResponseWriter, r *http.Request, body []byte, d
 		log.Printf("llm-proxy: unknown upstream type %q", us.Type)
 		http.Error(w, "no upstream configured", http.StatusBadGateway)
 	}
-}
-
-func ForwardMinimax(w http.ResponseWriter, r *http.Request, body []byte, us Upstream, providers []Provider) {
-	httpClient, tr := upstreamClient(us.TimeoutS)
-	defer tr.CloseIdleConnections()
-	upstreamURL := us.BaseURL
-	for i := range providers {
-		p := &providers[i]
-		log.Printf("minimax attempt %d/%d: provider=%s bytes=%d", i+1, len(providers), p.Name, len(body))
-
-		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
-		req.Header.Set("Content-Type", r.Header.Get("Content-Type"))
-		req.Header.Set("anthropic-version", r.Header.Get("anthropic-version"))
-		if v := r.Header.Get("anthropic-beta"); v != "" {
-			req.Header.Set("anthropic-beta", v)
-		}
-		req.Header.Set("x-api-key", p.Key)
-		req.Header.Set("Authorization", "Bearer "+p.Key)
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			if clientGone(r) {
-				log.Printf("provider=%s aborted: client disconnected", p.Name)
-				return
-			}
-			log.Printf("provider=%s transport error: %v", p.Name, err)
-			p.Stats.observe(0)
-			p.Stats.recordFailover()
-			continue
-		}
-		p.Stats.observe(resp.StatusCode)
-
-		ct := resp.Header.Get("Content-Type")
-		isSSE := strings.Contains(strings.ToLower(ct), "text/event-stream")
-
-		const peekCap = 4096
-		peek := make([]byte, 0, peekCap)
-		tee := io.TeeReader(resp.Body, &PeekBuf{Peek: &peek, Cap: peekCap})
-
-		if isSSE {
-			CopyHeaders(w.Header(), resp.Header)
-			if !ContainsHeader(resp.Header, "X-Accel-Buffering") {
-				w.Header().Set("X-Accel-Buffering", "no")
-			}
-			w.Header().Set("Cache-Control", "no-cache")
-			w.WriteHeader(resp.StatusCode)
-			fw := newFlushWriter(w)
-			if len(peek) > 0 {
-				if _, werr := fw.Write(peek); werr != nil {
-					resp.Body.Close()
-					log.Printf("provider=%s write err: %v", p.Name, werr)
-					return
-				}
-			}
-			streamErr := StreamSSE(fw, tee)
-			resp.Body.Close()
-			if streamErr != nil {
-				log.Printf("provider=%s stream err: %v", p.Name, streamErr)
-			}
-			return
-		}
-
-		n, _ := io.ReadFull(tee, make([]byte, peekCap))
-		firstChunk := append([]byte(nil), peek[:n]...)
-
-		if IsRateLimitError(resp.StatusCode, firstChunk) {
-			log.Printf("provider=%s returned 429 + rate_limit_error, retrying next", p.Name)
-			p.Stats.recordFailover()
-			resp.Body.Close()
-			continue
-		}
-
-		CopyHeaders(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		if len(firstChunk) > 0 {
-			w.Write(firstChunk)
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-
-		if n < peekCap {
-			resp.Body.Close()
-			log.Printf("provider=%s done (buffered %d bytes)", p.Name, n)
-			return
-		}
-
-		log.Printf("provider=%s streaming rest", p.Name)
-		_, copyErr := io.Copy(w, resp.Body)
-		resp.Body.Close()
-		if copyErr != nil {
-			log.Printf("provider=%s copy err: %v", p.Name, copyErr)
-		}
-		return
-	}
-
-	log.Printf("all providers exhausted with rate_limit_error")
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Retry-After", "60")
-	w.WriteHeader(http.StatusTooManyRequests)
-	w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"llm-proxy: all configured providers exhausted on rate limit"}}`))
 }
 
 // joinTarget builds the final upstream URL from a base URL and a path

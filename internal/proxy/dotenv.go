@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// --- .env loader (same as minimax-proxy) ---
+// --- .env loader ---
 
 func LoadDotEnv() {
 	path := os.Getenv("ENV_FILE")

@@ -10,29 +10,6 @@ import (
 	"llm-proxy/internal/proxy"
 )
 
-func TestIsRateLimitError(t *testing.T) {
-	cases := []struct {
-		name   string
-		status int
-		body   string
-		want   bool
-	}{
-		{"429 rate_limit_error", 429, `{"error":{"type":"rate_limit_error"}}`, true},
-		{"429 token plan usage limit", 429, `token plan usage limit reached`, true},
-		{"429 usage limit reached", 429, `usage limit reached`, true},
-		{"429 other error", 429, `{"error":{"type":"invalid_request_error"}}`, false},
-		{"200 rate_limit_error", 200, `{"error":{"type":"rate_limit_error"}}`, false},
-		{"429 empty body", 429, ``, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := proxy.IsRateLimitError(tc.status, []byte(tc.body)); got != tc.want {
-				t.Errorf("isRateLimitError(%d, %q) = %v, want %v", tc.status, tc.body, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestCopyHeadersSkipsHopByHop(t *testing.T) {
 	src := http.Header{
 		"Connection":        {"close"},

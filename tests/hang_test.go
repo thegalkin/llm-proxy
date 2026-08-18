@@ -90,41 +90,6 @@ func TestForwardOpencodeGoAllTimeout(t *testing.T) {
 	}
 }
 
-func TestForwardMinimaxTimeoutFailover(t *testing.T) {
-	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body) // drain body so the server watches for disconnects
-		if r.Header.Get("x-api-key") == "k1" {
-			<-r.Context().Done() // key1's upstream hangs until the proxy gives up
-			return
-		}
-		w.Write([]byte(`{"ok":true}`))
-	}))
-	defer upstreamSrv.Close()
-
-	providers := []proxy.Provider{
-		{Name: "minimax-coding-plan", Family: "minimax", Key: "k1"},
-		{Name: "minimax", Family: "minimax", Key: "k2"},
-	}
-	us := proxy.Upstream{Type: "minimax", BaseURL: upstreamSrv.URL, TimeoutS: 1}
-	rec := httptest.NewRecorder()
-	start := time.Now()
-	proxy.ForwardMinimax(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", nil), []byte(`{"model":"x"}`), us, providers)
-	elapsed := time.Since(start)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
-	}
-	if elapsed > 10*time.Second {
-		t.Errorf("forward took %v after key1 timeout, want fast failover", elapsed)
-	}
-	if got := providers[0].Stats.FailoverHits; got != 1 {
-		t.Errorf("providers[0].FailoverHits = %d, want 1", got)
-	}
-	if got := providers[1].Stats.Requests2xx; got != 1 {
-		t.Errorf("providers[1].Requests2xx = %d, want 1", got)
-	}
-}
-
 func TestForwardOpencodeGoCancelsUpstreamOnClientDisconnect(t *testing.T) {
 	upstreamCancelled := make(chan struct{})
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -165,9 +130,7 @@ func TestForwardOpencodeGoCancelsUpstreamOnClientDisconnect(t *testing.T) {
 // Bug: a rule `to: opencode-go/*` (used to route GO/* models to the
 // opencode-go family while preserving the model name) rewrote the model to
 // the literal "*" instead of the captured suffix. The upstream then answered
-// "Model * is not supported". The minimax family handled the star; the
-// opencode-go family did not.
-
+// "Model * is not supported".
 func TestDecideStarCaptureOpencodeGo(t *testing.T) {
 	cfg, err := proxy.LoadRoutingConfigFromString(`
 rules:
@@ -178,7 +141,7 @@ rules:
 		t.Fatalf("load config: %v", err)
 	}
 	body := []byte(`{"model":"GO/deepseek-v4-flash","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-	dec := proxy.Decide(&cfg, body, "/v1/messages", "minimax")
+	dec := proxy.Decide(&cfg, body, "/v1/messages", "")
 
 	if dec.Upstream.Type != "opencode-go" {
 		t.Errorf("upstream type = %q, want opencode-go", dec.Upstream.Type)
@@ -204,7 +167,7 @@ rules:
 		t.Fatalf("load config: %v", err)
 	}
 	body := []byte(`{"model":"GO/deepseek-v4-flash","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-	dec := proxy.Decide(&cfg, body, "/v1/messages", "minimax")
+	dec := proxy.Decide(&cfg, body, "/v1/messages", "")
 
 	var out struct {
 		Model string `json:"model"`
@@ -218,8 +181,8 @@ rules:
 }
 
 // The built-in default config must route the models opencode sends out of the
-// box (no config file): GO/* → opencode-go with the prefix stripped,
-// MiniMax-* → minimax, opencode-zen/zen/* → opencode-zen.
+// box (no config file): GO/* → opencode-go with the prefix stripped, and
+// opencode-zen/zen/* → opencode-zen.
 
 func TestDefaultConfigRoutesModels(t *testing.T) {
 	cfg, err := proxy.LoadRoutingConfigFromString("")
@@ -233,7 +196,7 @@ func TestDefaultConfigRoutesModels(t *testing.T) {
 	check := func(t *testing.T, model, wantType, wantModel string) {
 		t.Helper()
 		body := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-		dec := proxy.Decide(&cfg, body, "/v1/messages", "minimax")
+		dec := proxy.Decide(&cfg, body, "/v1/messages", "")
 		if dec.Upstream.Type != wantType {
 			t.Errorf("model %s: upstream type = %q, want %q", model, dec.Upstream.Type, wantType)
 		}
@@ -248,8 +211,7 @@ func TestDefaultConfigRoutesModels(t *testing.T) {
 		}
 	}
 	check(t, "GO/deepseek-v4-flash", "opencode-go", "deepseek-v4-flash")
-	check(t, "GO/minimax-m3", "opencode-go", "minimax-m3")
-	check(t, "MiniMax-M3", "minimax", "MiniMax-M3")
+	check(t, "GO/kimi-k3", "opencode-go", "kimi-k3")
 	// The zen namespace is a routing label only; the upstream serves the
 	// bare model name.
 	check(t, "opencode-zen/zen/deepseek-v4-flash", "opencode-zen", "deepseek-v4-flash")
@@ -284,7 +246,7 @@ func TestDecideDefaultTimeoutApplied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	dec := proxy.Decide(&cfg, []byte(`{"model":"GO/deepseek-v4-flash"}`), "/v1/messages", "minimax")
+	dec := proxy.Decide(&cfg, []byte(`{"model":"GO/deepseek-v4-flash"}`), "/v1/messages", "")
 	if dec.Upstream.TimeoutS != 77 {
 		t.Errorf("decided upstream TimeoutS = %d, want 77", dec.Upstream.TimeoutS)
 	}

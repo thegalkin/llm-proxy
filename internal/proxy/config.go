@@ -40,11 +40,8 @@ type Config struct {
 // --- default upstream (when no rule matches) ---
 
 const (
-	DefaultMinimaxURL  = "https://api.minimax.io/anthropic/v1/messages"
 	OpencodeGoBaseURL  = "https://opencode.ai/zen/go/v1"
 	opencodeZenBaseURL = "https://opencode.ai/zen/v1"
-	quotaRemainsURL    = "https://api.minimax.io/v1/token_plan/remains"
-	quotaRemainsCNURL  = "https://api.minimaxi.com/v1/token_plan/remains"
 	defaultListenAddr  = "127.0.0.1:8443"
 )
 
@@ -165,10 +162,9 @@ func LoadRoutingConfigFromString(src string) (Config, error) {
 const upstreamHeaderTimeout = 120 * time.Second
 
 // defaultConfig returns the built-in routing table. It must work out of the
-// box (no config file): opencode sends "GO/<model>" for the paid subscription,
-// "MiniMax-*" for the minimax family and "opencode-zen/zen/<model>" for the
-// Zen tier. Each rule rewrites the model field to the canonical name the
-// upstream serves.
+// box (no config file): opencode sends "GO/<model>" for the paid subscription
+// and "opencode-zen/zen/<model>" for the Zen tier. Each rule rewrites the
+// model field to the canonical name the upstream serves.
 func defaultConfig() Config {
 	cfg := Config{
 		ListenAddr: defaultListenAddr,
@@ -181,7 +177,6 @@ func defaultConfig() Config {
 	builtin := []struct{ from, to string }{
 		{"GO/*", "opencode-go/*"},
 		{"opencode-zen/zen/*", "opencode-zen zen/*"},
-		{"minimax/MiniMax-*", "minimax sub/minimax*"},
 	}
 	for i, b := range builtin {
 		us, preserveTo := buildUpstreamFromTo(b.to, "", "", "", cfg.DefaultUS)
@@ -211,7 +206,7 @@ func ParseToString(s string) (typ, mdl, base, url, eff string, ok bool) {
 		}
 	}
 	provider := ""
-	for _, c := range []string{"minimax", "opencode-go", "opencode-zen", "opencode"} {
+	for _, c := range []string{"opencode-go", "opencode-zen", "opencode"} {
 		if strings.HasPrefix(s, c+" ") || strings.HasPrefix(s, c+"/") {
 			provider = c
 			s = strings.TrimSpace(strings.TrimPrefix(s, c))
@@ -227,29 +222,6 @@ func ParseToString(s string) (typ, mdl, base, url, eff string, ok bool) {
 	}
 	namespace := s[:idx]
 	mod := s[idx+1:]
-	if provider == "minimax" {
-		if namespace != "sub" {
-			return "", "", "", "", "", false
-		}
-		lower := strings.ToLower(mod)
-		preserveSuffix := ""
-		if strings.HasSuffix(lower, "*") {
-			preserveSuffix = "*"
-			mod = mod[:len(mod)-1]
-			lower = lower[:len(lower)-1]
-		}
-		// Canonical casing must survive the star-preserve path too:
-		// "minimax*" -> "MiniMax-*", so a captured "m3" becomes
-		// "MiniMax-m3", not "minimaxm3".
-		if strings.HasPrefix(lower, "minimax-") {
-			mod = "MiniMax-" + mod[len("minimax-"):]
-		} else if strings.HasPrefix(lower, "minimax") {
-			mod = "MiniMax-" + mod[len("minimax"):]
-		}
-		mod = mod + preserveSuffix
-		typ = "minimax"
-		return typ, mod, "", "", effTok, true
-	}
 	if provider == "opencode-zen" {
 		if namespace == "" {
 			return "", "", "", "", "", false
@@ -279,10 +251,7 @@ func buildUpstreamFromTo(to, base, url, eff string, fallback Upstream) (Upstream
 		preserveTo = strings.TrimSuffix(mdl, "*")
 	}
 	us := Upstream{Type: typ, Model: mdl}
-	if typ == "minimax" {
-		us.BaseURL = DefaultMinimaxURL
-		us.URLPattern = "/v1/messages"
-	} else if typ == "opencode-zen" {
+	if typ == "opencode-zen" {
 		us.BaseURL = opencodeZenBaseURL
 		us.URLPattern = "/chat/completions"
 	} else {
@@ -344,16 +313,16 @@ func (c *Config) ResolveRule(reqID string) Upstream {
 		if r.CaptureSrc >= 0 && r.CaptureSrc < len(match) && strings.HasSuffix(us.Model, "*") {
 			prefix := strings.TrimSuffix(us.Model, "*")
 			// Re-match against the original key so the capture keeps the
-			// request's casing ("MiniMax-M3", not "minimax-m3"); the
-			// lowercased match is only used for case-insensitive routing.
+			// request's casing; the lowercased match is only used for
+			// case-insensitive routing.
 			capture := match[r.CaptureSrc]
 			if orig := r.MatchRe.FindStringSubmatch(reqID); orig != nil && r.CaptureSrc < len(orig) {
 				capture = orig[r.CaptureSrc]
 			}
-			// The separator dash may live on either side (a from:
-			// "opencode-go/minimax*" capture is "-m3", a from:
-			// "minimax/MiniMax-*" capture is "m3"); normalize so the
-			// composed name never gains or loses it.
+			// The separator dash may live on either side of the capture
+			// (e.g. "-k3" from "opencode-go/kimi-k3*" vs "k3" from
+			// "GO/k3"); normalize so the composed name never gains or
+			// loses it.
 			capture = strings.TrimPrefix(capture, "-")
 			if capture == "" {
 				us.Model = strings.TrimSuffix(prefix, "-")
