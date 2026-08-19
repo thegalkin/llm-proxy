@@ -38,8 +38,8 @@ missing: null
 func TestParseYAMLRules(t *testing.T) {
 	src := `
 rules:
-  - from: "GO/*"
-    to: opencode-go/*
+  - from: "minimax/*"
+    to: minimax sub/minimax*
     priority: 10
   - from: opencode-go/kimi-k3
     to: opencode-go/deepseek-v4-flash
@@ -60,10 +60,10 @@ rules:
 	if !ok {
 		t.Fatalf("rules[0] = %T, want map[string]any", rules[0])
 	}
-	if first["from"] != "GO/*" {
-		t.Errorf("from = %v, want GO/*", first["from"])
+	if first["from"] != "minimax/*" {
+		t.Errorf("from = %v, want minimax/*", first["from"])
 	}
-	if first["to"] != "opencode-go/*" {
+	if first["to"] != "minimax sub/minimax*" {
 		t.Errorf("to = %v", first["to"])
 	}
 	if first["priority"] != int64(10) {

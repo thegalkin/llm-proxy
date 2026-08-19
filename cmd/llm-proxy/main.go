@@ -1,11 +1,13 @@
 // llm-proxy — multi-provider LLM reverse proxy with YAML routing table.
 //
+// Replaces minimax-proxy. Adds:
 //   - YAML routing table at ~/.config/llm-proxy/config.yaml (hot-reloadable
 //     via SIGHUP — not implemented yet, but the loader is easy to re-run).
 //   - OpenAI/Anthropic-shape routing by either request host or body model
 //     field. Each rule selects an upstream and (optionally) rewrites the
 //     "model" field to a canonical name the upstream actually serves.
 //   - Provider types:
+//     minimax   → internal MiniMax LB with two-key failover (legacy)
 //     opencode-go → opencode-go subscription (https://opencode.ai/api/v1)
 //     passthrough → direct upstream URL (model rewrite optional)
 //

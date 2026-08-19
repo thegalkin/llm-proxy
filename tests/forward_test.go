@@ -6,10 +6,80 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"llm-proxy/internal/proxy"
 )
+
+func TestForwardMinimaxFailover(t *testing.T) {
+	var hits int32
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		if n == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"type":"rate_limit_error"}}`))
+			return
+		}
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstreamSrv.Close()
+
+	providers := []proxy.Provider{
+		{Name: "minimax-coding-plan", Family: "minimax", Key: "k1"},
+		{Name: "minimax", Family: "minimax", Key: "k2"},
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	us := proxy.Upstream{Type: "minimax", BaseURL: upstreamSrv.URL}
+	proxy.ForwardMinimax(rec, req, []byte(`{"model":"MiniMax-m3"}`), us, providers)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if got := providers[0].Stats.Requests429; got != 1 {
+		t.Errorf("providers[0].Requests429 = %d, want 1", got)
+	}
+	if got := providers[0].Stats.FailoverHits; got != 1 {
+		t.Errorf("providers[0].FailoverHits = %d, want 1", got)
+	}
+	if got := providers[1].Stats.Requests2xx; got != 1 {
+		t.Errorf("providers[1].Requests2xx = %d, want 1", got)
+	}
+	if got := providers[1].Stats.FailoverHits; got != 0 {
+		t.Errorf("providers[1].FailoverHits = %d, want 0", got)
+	}
+}
+
+func TestForwardMinimaxAllExhausted(t *testing.T) {
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":{"type":"rate_limit_error"}}`))
+	}))
+	defer upstreamSrv.Close()
+
+	providers := []proxy.Provider{
+		{Name: "minimax-coding-plan", Family: "minimax", Key: "k1"},
+		{Name: "minimax", Family: "minimax", Key: "k2"},
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	us := proxy.Upstream{Type: "minimax", BaseURL: upstreamSrv.URL}
+	proxy.ForwardMinimax(rec, req, []byte(`{"model":"x"}`), us, providers)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After = %q, want 60", got)
+	}
+	if got := providers[0].Stats.FailoverHits; got != 1 {
+		t.Errorf("providers[0].FailoverHits = %d, want 1", got)
+	}
+	if got := providers[1].Stats.FailoverHits; got != 1 {
+		t.Errorf("providers[1].FailoverHits = %d, want 1", got)
+	}
+}
 
 func TestForwardOpencodeGoFailover(t *testing.T) {
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

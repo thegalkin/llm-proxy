@@ -7,11 +7,11 @@ import (
 	"time"
 )
 
-// --- providers (failover counters) ---
+// --- providers (failover counters; same shape as minimax-proxy) ---
 
 type Provider struct {
-	Name   string // friendly alias (e.g. "opencode-go-1")
-	Family string // "opencode-go" | "opencode-zen" — used by routing/forwarding
+	Name   string // friendly alias (e.g. "minimax-coding-plan", "opencode-go-1")
+	Family string // "minimax" | "opencode-go" — used by routing/forwarding
 	Key    string
 	Stats  ProviderStats
 }
@@ -55,6 +55,20 @@ type ProviderError struct {
 func LoadProviders() ([]Provider, error) {
 	providers := []Provider{}
 
+	// Minimax subscription — two distinct keys, must both be set.
+	codingKey := os.Getenv("MINIMAX_CODING_PLAN_KEY")
+	secondaryKey := os.Getenv("MINIMAX_KEY")
+	if codingKey == "" || secondaryKey == "" {
+		return nil, fmt.Errorf("MINIMAX_CODING_PLAN_KEY and MINIMAX_KEY must both be set")
+	}
+	if codingKey == secondaryKey {
+		return nil, fmt.Errorf("MINIMAX_CODING_PLAN_KEY and MINIMAX_KEY are identical — the whole point of this proxy is to use two DIFFERENT keys")
+	}
+	providers = append(providers,
+		Provider{Name: "minimax-coding-plan", Family: "minimax", Key: codingKey},
+		Provider{Name: "minimax", Family: "minimax", Key: secondaryKey},
+	)
+
 	// opencode-go subscription — keys read from OPENCODE_GO_KEY_1..N. Blank
 	// entries are skipped; bare numeric suffix is appended to the alias.
 	for i := 1; i <= 16; i++ {
@@ -77,10 +91,6 @@ func LoadProviders() ([]Provider, error) {
 			Family: "opencode-zen",
 			Key:    zk,
 		})
-	}
-
-	if len(providers) == 0 {
-		return nil, fmt.Errorf("no providers configured: set OPENCODE_GO_KEY_1..N and/or OPENCODE_ZEN_KEY")
 	}
 
 	return providers, nil

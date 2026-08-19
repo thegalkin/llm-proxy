@@ -14,6 +14,12 @@ func TestParseToString_ParseOnly(t *testing.T) {
 		wantEff string
 		wantOk  bool
 	}{
+		{"minimax sub/MiniMax-M3", "minimax", "MiniMax-M3", "", true},
+		// The star must keep the canonical "MiniMax-" prefix so a captured
+		// "m3" becomes "MiniMax-m3" (not "minimaxm3"). ResolveRule trims
+		// a leading dash from the capture either way.
+		{"minimax sub/minimax*", "minimax", "MiniMax-*", "", true},
+		{"minimax sub/minimax-m3", "minimax", "MiniMax-m3", "", true},
 		{"opencode-go/deepseek-v4-flash", "opencode-go", "deepseek-v4-flash", "", true},
 		{"opencode-go/deepseek max", "opencode-go", "deepseek", "max", true},
 		{"opencode-go/deepseek low", "opencode-go", "deepseek", "low", true},
@@ -46,9 +52,9 @@ func TestCompileFromPattern(t *testing.T) {
 		wantOk  bool
 		wantCap string
 	}{
-		{"opencode-go/kimi*", "opencode-go/kimi-k3", true, "-k3"},
-		{"opencode-go/kimi*", "opencode-go/kimi-k2.7", true, "-k2.7"},
-		{"opencode-go/kimi*", "opencode-go/glm-5.2", false, ""},
+		{"opencode-go/minimax*", "opencode-go/minimax-m3", true, "-m3"},
+		{"opencode-go/minimax*", "opencode-go/minimax-m2.7", true, "-m2.7"},
+		{"opencode-go/minimax*", "opencode-go/kimi-k3", false, ""},
 		{"opencode-go/*", "opencode-go/kimi-k3", true, "kimi-k3"},
 		{"*", "anything", true, "anything"},
 		{"opencode-go/kimi-k3", "opencode-go/kimi-k3", true, ""},

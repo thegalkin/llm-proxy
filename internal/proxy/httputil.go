@@ -8,7 +8,17 @@ import (
 	"strings"
 )
 
-// --- shared HTTP helpers ---
+// --- shared HTTP helpers (copied from minimax-proxy to keep no deps) ---
+
+func IsRateLimitError(statusCode int, body []byte) bool {
+	if statusCode != http.StatusTooManyRequests {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "rate_limit_error") ||
+		strings.Contains(lower, "token plan usage limit") ||
+		strings.Contains(lower, "usage limit reached")
+}
 
 func CopyHeaders(dst, src http.Header) {
 	for k, vs := range src {

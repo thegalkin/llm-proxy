@@ -1,4 +1,5 @@
 /llm-proxy
+/minimax-proxy
 /.env
 /.env.example
 /.omo/

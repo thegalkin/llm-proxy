@@ -21,10 +21,11 @@ upstream = "https://opencode.ai/zen/go/v1/chat/completions"
 key := os.Getenv("UPSTREAM_KEY")
 srv := proxy.NewServer(
 upstream, key,
-	proxy.WithModelMap(map[string]string{
-		"GO/deepseek-v4-flash":          "deepseek-v4-flash",
-		"opencode-go/deepseek-v4-flash": "deepseek-v4-flash",
-	}),
+proxy.WithModelMap(map[string]string{
+"GO/deepseek-v4-flash":            "deepseek-v4-flash",
+"GO/minimax-m3":                   "minimax-m3",
+"opencode-go/deepseek-v4-flash":   "deepseek-v4-flash",
+}),
 )
 mux := http.NewServeMux()
 mux.Handle("/v1/messages", srv.Handler())
