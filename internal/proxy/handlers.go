@@ -104,21 +104,25 @@ func HandleModels(cfg *Config) http.HandlerFunc {
 		if cfg.DefaultUS.Model != "" && cfg.DefaultUS.Model != "*" {
 			add("llm-proxy/GO/" + cfg.DefaultUS.Model)
 		}
+		// Synced with GET https://opencode.ai/zen/v1/models (2026-08-22, 64
+		// models). Includes x-preview-f-free = "Ox Alpha Free (Unlimited)".
 		zenModels := []string{
-			"big-pickle", "claude-fable-5", "claude-haiku-4-5", "claude-opus-4-1",
-			"claude-opus-4-5", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8",
-			"claude-opus-5", "claude-sonnet-4", "claude-sonnet-4-5", "claude-sonnet-4-6",
-			"claude-sonnet-5", "deepseek-v4-flash", "deepseek-v4-flash-free", "deepseek-v4-pro",
+			"big-pickle", "claude-fable-5", "claude-haiku-4-5", "claude-opus-4-5",
+			"claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+			"claude-sonnet-4", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-sonnet-5",
+			"deepseek-v4-flash", "deepseek-v4-flash-free", "deepseek-v4-pro", "gemini-3-flash",
 			"gemini-3.1-pro", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash",
-			"gemini-3-flash", "glm-5", "glm-5.1", "glm-5.2", "gpt-5", "gpt-5.1",
+			"gemini-3.7-flash", "glm-5", "glm-5.1", "glm-5.2",
+			"gpt-5", "gpt-5-codex", "gpt-5-nano", "gpt-5.1",
 			"gpt-5.1-codex", "gpt-5.1-codex-max", "gpt-5.1-codex-mini", "gpt-5.2",
 			"gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.4",
-			"gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro",
-			"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5-codex", "gpt-5-nano",
-			"grok-4.5", "grok-build-0.1", "kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code",
-			"kimi-k3", "laguna-s-2.1-free", "ling-3.0-flash-free", "longcat-2.0-free",
-			"mimo-v2.5-free", "minimax-m2.5", "minimax-m2.7", "minimax-m3",
-			"nemotron-3-ultra-free", "north-mini-code-free", "qwen3.5-plus", "qwen3.6-plus",
+			"gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro", "gpt-5.5",
+			"gpt-5.5-pro", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+			"grok-4.5", "grok-4.6", "grok-build-0.1", "hy3-free",
+			"kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code", "kimi-k3",
+			"laguna-s-2.1-free", "mimo-v2.5-free", "minimax-m2.5", "minimax-m2.7",
+			"minimax-m3", "muse-spark-1.2", "muse-spark-1.2-contributor-free", "nemotron-3-ultra-free",
+			"nemotron-3.5-lightning-free", "qwen3.5-plus", "qwen3.6-plus", "x-preview-f-free",
 		}
 		for _, m := range zenModels {
 			add("llm-proxy/opencode-zen/zen/" + m)

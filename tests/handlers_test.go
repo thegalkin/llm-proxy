@@ -60,6 +60,7 @@ func TestHandleModels(t *testing.T) {
 		"llm-proxy/GO/deepseek-v4-flash",
 		"llm-proxy/GO/minimax-m3",
 		"llm-proxy/opencode-zen/zen/claude-sonnet-4-6",
+		"llm-proxy/opencode-zen/zen/x-preview-f-free",
 	} {
 		if !ids[want] {
 			t.Errorf("model %q missing from /v1/models", want)
