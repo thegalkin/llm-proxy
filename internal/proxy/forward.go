@@ -395,9 +395,12 @@ func ForwardOpencodeZen(w http.ResponseWriter, r *http.Request, body []byte, us 
 	if v := r.Header.Get("anthropic-beta"); v != "" {
 		req.Header.Set("anthropic-beta", v)
 	}
-	if v := r.Header.Get("x-api-key"); v != "" {
-		req.Header.Set("x-api-key", v)
-	}
+	// The upstream zen /v1/messages (Anthropic-style) endpoint authenticates
+	// by x-api-key, not Authorization. Never forward the client's header here:
+	// opencode sends a dummy apiKey ("proxy-handles-auth") that would 401 the
+	// upstream. Always present the real zen key (same pattern as ForwardMinimax
+	// and ForwardOpencodeGo).
+	req.Header.Set("x-api-key", zen.Key)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
