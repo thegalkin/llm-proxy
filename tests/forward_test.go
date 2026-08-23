@@ -13,6 +13,7 @@ import (
 )
 
 func TestForwardMinimaxFailover(t *testing.T) {
+	proxy.ResetRotationForTest()
 	var hits int32
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := atomic.AddInt32(&hits, 1)
@@ -52,6 +53,7 @@ func TestForwardMinimaxFailover(t *testing.T) {
 }
 
 func TestForwardMinimaxAllExhausted(t *testing.T) {
+	proxy.ResetRotationForTest()
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		w.Write([]byte(`{"error":{"type":"rate_limit_error"}}`))
@@ -82,6 +84,7 @@ func TestForwardMinimaxAllExhausted(t *testing.T) {
 }
 
 func TestForwardOpencodeGoFailover(t *testing.T) {
+	proxy.ResetRotationForTest()
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "Bearer k1" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -116,6 +119,7 @@ func TestForwardOpencodeGoFailover(t *testing.T) {
 }
 
 func TestForwardOpencodeGoFailoverOn400(t *testing.T) {
+	proxy.ResetRotationForTest()
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "Bearer k1" {
 			w.WriteHeader(http.StatusBadRequest)
@@ -147,6 +151,7 @@ func TestForwardOpencodeGoFailoverOn400(t *testing.T) {
 }
 
 func TestForwardOpencodeGoAll400(t *testing.T) {
+	proxy.ResetRotationForTest()
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(`{"model":"deepseek-v4-flash"}`))

@@ -25,6 +25,7 @@ import (
 // cancellation of the upstream request when the client disconnects.
 
 func TestForwardOpencodeGoTimeoutFailover(t *testing.T) {
+	proxy.ResetRotationForTest()
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body) // drain body so the server watches for disconnects
 		if r.Header.Get("Authorization") == "Bearer k1" {
@@ -60,6 +61,7 @@ func TestForwardOpencodeGoTimeoutFailover(t *testing.T) {
 }
 
 func TestForwardOpencodeGoAllTimeout(t *testing.T) {
+	proxy.ResetRotationForTest()
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body) // drain body so the server watches for disconnects
 		<-r.Context().Done()
@@ -91,6 +93,7 @@ func TestForwardOpencodeGoAllTimeout(t *testing.T) {
 }
 
 func TestForwardMinimaxTimeoutFailover(t *testing.T) {
+	proxy.ResetRotationForTest()
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body) // drain body so the server watches for disconnects
 		if r.Header.Get("x-api-key") == "k1" {

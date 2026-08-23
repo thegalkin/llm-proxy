@@ -61,8 +61,11 @@ func ForwardMinimax(w http.ResponseWriter, r *http.Request, body []byte, us Upst
 	httpClient, tr := upstreamClient(us.TimeoutS)
 	defer tr.CloseIdleConnections()
 	upstreamURL := us.BaseURL
+	ptrs := make([]*Provider, len(providers))
 	for i := range providers {
-		p := &providers[i]
+		ptrs[i] = &providers[i]
+	}
+	for i, p := range buildAttemptOrder("minimax", ptrs) {
 		log.Printf("minimax attempt %d/%d: provider=%s bytes=%d", i+1, len(providers), p.Name, len(body))
 
 		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
@@ -83,6 +86,7 @@ func ForwardMinimax(w http.ResponseWriter, r *http.Request, body []byte, us Upst
 			log.Printf("provider=%s transport error: %v", p.Name, err)
 			p.Stats.observe(0)
 			p.Stats.recordFailover()
+			setCooldown(p, 0, "", nil)
 			continue
 		}
 		p.Stats.observe(resp.StatusCode)
@@ -123,10 +127,12 @@ func ForwardMinimax(w http.ResponseWriter, r *http.Request, body []byte, us Upst
 		if IsRateLimitError(resp.StatusCode, firstChunk) {
 			log.Printf("provider=%s returned 429 + rate_limit_error, retrying next", p.Name)
 			p.Stats.recordFailover()
+			setCooldown(p, resp.StatusCode, resp.Header.Get("Retry-After"), firstChunk)
 			resp.Body.Close()
 			continue
 		}
 
+		markKeySuccess("minimax", p)
 		CopyHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		if len(firstChunk) > 0 {
@@ -245,7 +251,7 @@ func ForwardOpencodeGo(w http.ResponseWriter, r *http.Request, body []byte, us U
 	// every key rejects the request with 400.
 	badRequestCount := 0
 	var firstBadRequestBody []byte
-	for i, p := range keys {
+	for i, p := range buildAttemptOrder("opencode-go", keys) {
 		log.Printf("opencode-go attempt %d/%d: provider=%s target=%s bytes=%d", i+1, len(keys), p.Name, target, len(body))
 		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -268,6 +274,7 @@ func ForwardOpencodeGo(w http.ResponseWriter, r *http.Request, body []byte, us U
 			log.Printf("opencode-go provider=%s transport error: %v", p.Name, err)
 			p.Stats.observe(0)
 			p.Stats.recordFailover()
+			setCooldown(p, 0, "", nil)
 			continue
 		}
 		p.Stats.observe(resp.StatusCode)
@@ -280,6 +287,7 @@ func ForwardOpencodeGo(w http.ResponseWriter, r *http.Request, body []byte, us U
 		tee := io.TeeReader(resp.Body, &PeekBuf{Peek: &peek, Cap: peekCap})
 
 		if isSSE {
+			markKeySuccess("opencode-go", p)
 			CopyHeaders(w.Header(), resp.Header)
 			if !ContainsHeader(resp.Header, "X-Accel-Buffering") {
 				w.Header().Set("X-Accel-Buffering", "no")
@@ -305,9 +313,27 @@ func ForwardOpencodeGo(w http.ResponseWriter, r *http.Request, body []byte, us U
 		n, _ := io.ReadFull(tee, make([]byte, peekCap))
 		firstChunk := append([]byte(nil), peek[:n]...)
 
+		if IsModelShapeError(resp.StatusCode, firstChunk) {
+			// Model is not served on this upstream — rotating to another key
+			// with the same model is pointless. Surface the upstream error
+			// verbatim so the client sees the real cause instead of a
+			// misleading "all keys exhausted" 429.
+			log.Printf("opencode-go provider=%s returned %d (model shape), surfacing to client: %s", p.Name, resp.StatusCode, firstChunk)
+			CopyHeaders(w.Header(), resp.Header)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
+			if len(firstChunk) > 0 {
+				w.Write(firstChunk)
+			} else {
+				w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"llm-proxy: model not supported on this upstream"}}`))
+			}
+			resp.Body.Close()
+			return
+		}
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusBadRequest {
 			log.Printf("opencode-go provider=%s returned %d, retrying next: %s", p.Name, resp.StatusCode, firstChunk)
 			p.Stats.recordFailover()
+			setCooldown(p, resp.StatusCode, resp.Header.Get("Retry-After"), firstChunk)
 			if resp.StatusCode == http.StatusBadRequest {
 				badRequestCount++
 				if firstBadRequestBody == nil {
@@ -318,6 +344,7 @@ func ForwardOpencodeGo(w http.ResponseWriter, r *http.Request, body []byte, us U
 			continue
 		}
 
+		markKeySuccess("opencode-go", p)
 		CopyHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		if len(firstChunk) > 0 {

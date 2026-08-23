@@ -56,6 +56,30 @@ func Decide(cfg *Config, body []byte, requestPath string, hostProvider string) R
 			return rd
 		}
 		rd.RewrittenBody = newBody
+	} else if model != "" && (us.Type == "opencode-go" || us.Type == "opencode-zen") {
+		// Strip a leading "<provider>/" or "<provider>/zen/" prefix from
+		// the body model — these upstreams serve bare names like
+		// "deepseek-v4-flash" or "big-pickle" and reject the prefixed
+		// form with 401 ModelError. Anthropic keeps the bare name.
+		prefixes := []string{us.Type + "/zen/", us.Type + "/"}
+		bare := model
+		for _, p := range prefixes {
+			if strings.HasPrefix(bare, p) {
+				bare = strings.TrimPrefix(bare, p)
+				break
+			}
+		}
+		if bare != model {
+			mObj["model"] = bare
+			newBody, err := json.Marshal(mObj)
+			if err != nil {
+				rd.RewrittenBody = body
+			} else {
+				rd.RewrittenBody = newBody
+			}
+		} else {
+			rd.RewrittenBody = body
+		}
 	} else {
 		rd.RewrittenBody = body
 	}

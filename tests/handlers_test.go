@@ -214,7 +214,8 @@ func TestParseQuotaPayloadBad(t *testing.T) {
 }
 
 func TestProbeProviderQuotaOpencodeGo(t *testing.T) {
-	report := proxy.ProbeProviderQuota(context.Background(), proxy.Provider{Name: "go-1", Family: "opencode-go", Key: "k"})
+	p := proxy.Provider{Name: "go-1", Family: "opencode-go", Key: "k"}
+	report := proxy.ProbeProviderQuota(context.Background(), &p)
 	if report.Quota.OK {
 		t.Error("OK should be false")
 	}

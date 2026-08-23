@@ -14,6 +14,10 @@ type Provider struct {
 	Family string // "minimax" | "opencode-go" — used by routing/forwarding
 	Key    string
 	Stats  ProviderStats
+	// cooldownUntil is a unixnano deadline (0 = none): after a recent
+	// 429/401/403/400/timeout the key is skipped until the deadline passes,
+	// then it re-enters rotation and is probed again — never forgotten.
+	cooldownUntil atomic.Int64
 }
 
 type ProviderStats struct {

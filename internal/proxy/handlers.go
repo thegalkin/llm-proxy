@@ -150,8 +150,8 @@ func HandleLimits(cfg *Config, providers []Provider) http.HandlerFunc {
 		defer cancel()
 
 		results := make([]ProviderReport, len(providers))
-		for i, p := range providers {
-			results[i] = ProbeProviderQuota(ctx, p)
+		for i := range providers {
+			results[i] = ProbeProviderQuota(ctx, &providers[i])
 		}
 
 		out := map[string]any{
@@ -194,7 +194,7 @@ type ProviderReport struct {
 
 // probeProviderQuota fetches and parses the MiniMax token-plan quota for a
 // provider. Providers without a quota API (opencode-go) report an error.
-func ProbeProviderQuota(ctx context.Context, p Provider) ProviderReport {
+func ProbeProviderQuota(ctx context.Context, p *Provider) ProviderReport {
 	report := ProviderReport{Provider: p.Name, Stats: p.Stats, Quota: providerQuota{}}
 	if p.Family == "opencode-go" {
 		report.Quota.OK = false
