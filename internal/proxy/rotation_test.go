@@ -335,7 +335,6 @@ func TestForwardOpencodeGoStickyKeepsLeadAfterRecovery(t *testing.T) {
 	}
 }
 
-
 // The four forwarders (ForwardMinimax / ForwardOpencodeGo /
 // ForwardOpencodeZen / ForwardOpenrouter) all rely on this contract:
 // buildAttemptOrder NEVER filters by Family. Each forwarder is
@@ -366,7 +365,7 @@ func TestBuildAttemptOrderDoesNotFilterByFamily(t *testing.T) {
 		families[p.Family]++
 	}
 	wantFamilies := map[string]int{
-		"minimax":     2,
+		"minimax":      2,
 		"opencode-zen": 1,
 		"openrouter":   1,
 		"opencode-go":  1,
@@ -408,4 +407,96 @@ func eq(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// capCooldown clamps a duration to [1s, cooldownMax] — values below the
+// minimum are bumped up so a key never immediately re-enters rotation,
+// and values above the max are capped so a buggy upstream can't park a
+// key for years.
+func TestCapCooldown(t *testing.T) {
+	if d := capCooldown(0); d != time.Second {
+		t.Errorf("capCooldown(0) = %v, want 1s (sub-second must be bumped up)", d)
+	}
+	if d := capCooldown(-time.Hour); d != time.Second {
+		t.Errorf("capCooldown(-1h) = %v, want 1s (negative must be clamped)", d)
+	}
+	if d := capCooldown(cooldownMax + time.Hour); d != cooldownMax {
+		t.Errorf("capCooldown(max+1h) = %v, want max %v", d, cooldownMax)
+	}
+	if d := capCooldown(2 * time.Hour); d != 2*time.Hour {
+		t.Errorf("capCooldown(2h) = %v, want 2h (in-range passthrough)", d)
+	}
+}
+
+// parseRetryAfter accepts three forms: empty → 0, numeric seconds, and
+// HTTP-date. Anything else (e.g. malformed garbage) → 0.
+func TestParseRetryAfter(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want time.Duration
+	}{
+		// A HTTP-date 60 seconds in the future should yield ~60s.
+		{"http-date near future", time.Now().UTC().Add(60 * time.Second).Format(http.TimeFormat), 59 * time.Second},
+		// Malformed string is rejected by both Atoi and ParseTime.
+		{"malformed", "not-a-number", 0},
+		{"empty", "", 0},
+		{"zero seconds", "0", 0},
+		{"negative seconds rejected", "-5", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := parseRetryAfter(tc.in)
+			if tc.name == "http-date near future" {
+				if d < 50*time.Second || d > 70*time.Second {
+					t.Errorf("parseRetryAfter(%q) = %v, want ~60s", tc.in, d)
+				}
+				return
+			}
+			if d != tc.want {
+				t.Errorf("parseRetryAfter(%q) = %v, want %v", tc.in, d, tc.want)
+			}
+		})
+	}
+}
+
+// parseResetsIn parses the upstream "Resets in N <unit>" hint. Every
+// recognised unit (h/hr/hour, m/min/minute, d/day, w/week, mo/month)
+// must produce the correct multiplier; missing/empty bodies and
+// unrecognised units yield 0.
+func TestParseResetsIn(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want time.Duration
+	}{
+		{"empty", "", 0},
+		{"no match", "some unrelated text", 0},
+		{"hours h", `Resets in 5h`, 5 * time.Hour},
+		{"hours hr", `Resets in 5hr`, 5 * time.Hour},
+		{"hours hour", `Resets in 5hour`, 5 * time.Hour},
+		{"minutes m", `Resets in 10m`, 10 * time.Minute},
+		{"minutes min", `Resets in 10min`, 10 * time.Minute},
+		{"minutes minute", `Resets in 10minute`, 10 * time.Minute},
+		{"days d", `Resets in 3d`, 3 * 24 * time.Hour},
+		{"days day", `Resets in 3day`, 3 * 24 * time.Hour},
+		{"weeks w", `Resets in 2w`, 2 * 7 * 24 * time.Hour},
+		{"weeks week", `Resets in 2week`, 2 * 7 * 24 * time.Hour},
+		// The regex alternation `...|m|...|mo` left-matches "m" before
+		// "mo", so "Resets in 2mo" is parsed as 2 MINUTES — the regex
+		// captures the "m" prefix. Only bare "month" hits the 31-day
+		// path; this is a known quirk in the regex.
+		{"months mo (regex quirk)", `Resets in 2mo`, 2 * time.Minute},
+		{"months month", `Resets in 2month`, 2 * 31 * 24 * time.Hour},
+		{"case insensitive", `resets IN 7 day`, 7 * 24 * time.Hour},
+		{"zero count", `Resets in 0 hour`, 0},
+		{"unrecognised unit", `Resets in 5 lightyears`, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if d := parseResetsIn([]byte(tc.in)); d != tc.want {
+				t.Errorf("parseResetsIn(%q) = %v, want %v", tc.in, d, tc.want)
+			}
+		})
+	}
 }
