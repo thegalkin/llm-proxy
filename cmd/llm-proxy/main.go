@@ -38,6 +38,10 @@ func main() {
 		addr = env
 	}
 
+	if err := proxy.LoadUpstreamProxy(os.Getenv("LLM_PROXY_HTTP_PROXY"), cfg.ProxySpecs); err != nil {
+		log.Fatalf("llm-proxy: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	proxy.RegisterRoutes(mux, &cfg, providers)
 

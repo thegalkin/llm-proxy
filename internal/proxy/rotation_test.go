@@ -22,7 +22,7 @@ func TestBuildAttemptOrderNoLastGood(t *testing.T) {
 	}
 }
 
-func TestBuildAttemptOrderRotatesAfterLastGood(t *testing.T) {
+func TestBuildAttemptOrderSticksToLastGood(t *testing.T) {
 	ResetRotationForTest()
 	ps := []*Provider{
 		{Name: "a", Family: "f"},
@@ -31,9 +31,29 @@ func TestBuildAttemptOrderRotatesAfterLastGood(t *testing.T) {
 	}
 	markKeySuccess("f", ps[1]) // last good = b
 	got := names(buildAttemptOrder("f", ps))
-	want := []string{"c", "a", "b"}
+	want := []string{"b", "c", "a"}
 	if !eq(got, want) {
-		t.Fatalf("order = %v, want %v", got, want)
+		t.Fatalf("order = %v, want %v (sticky: last good first)", got, want)
+	}
+}
+
+// A recovered key must NOT steal the lead back from the key that is
+// currently being burned — sticky keeps the last successful key in front.
+func TestBuildAttemptOrderStickyAfterCooldownExpiry(t *testing.T) {
+	ResetRotationForTest()
+	ps := []*Provider{
+		{Name: "a", Family: "f"},
+		{Name: "b", Family: "f"},
+	}
+	// a exhausted (cooling), b took over as last good.
+	ps[0].cooldownUntil.Store(time.Now().Add(10 * time.Minute).UnixNano())
+	markKeySuccess("f", ps[1])
+	// a's cooldown expires — but b stays the lead.
+	ps[0].cooldownUntil.Store(time.Now().Add(-time.Second).UnixNano())
+	got := names(buildAttemptOrder("f", ps))
+	want := []string{"b", "a"}
+	if !eq(got, want) {
+		t.Fatalf("order = %v, want %v (recovered key must not steal the lead)", got, want)
 	}
 }
 
@@ -121,8 +141,32 @@ func TestCooldownForRetryAfterHeader(t *testing.T) {
 func TestCooldownForResetsInParsing(t *testing.T) {
 	body := []byte(`{"type":"error","error":{"message":"Weekly usage limit reached. Resets in 23hr 60min."}}`)
 	d := cooldownFor(http.StatusTooManyRequests, "", body)
+	if d != 23*time.Hour {
+		t.Fatalf("Resets in 23hr -> %v, want 23h (kept below cooldownMax)", d)
+	}
+}
+
+func TestCooldownForResetsInWeeks(t *testing.T) {
+	body := []byte(`{"error":{"message":"Monthly usage limit reached. Resets in 2 weeks"}}`)
+	d := cooldownFor(http.StatusTooManyRequests, "", body)
+	if d != 14*24*time.Hour {
+		t.Fatalf("Resets in 2 weeks -> %v, want 14d", d)
+	}
+}
+
+func TestCooldownForResetsInMonths(t *testing.T) {
+	body := []byte(`{"error":{"message":"Resets in 1 month"}}`)
+	d := cooldownFor(http.StatusTooManyRequests, "", body)
+	if d != 31*24*time.Hour {
+		t.Fatalf("Resets in 1 month -> %v, want 31d", d)
+	}
+}
+
+func TestCooldownForResetsInCapsAtMax(t *testing.T) {
+	body := []byte(`{"error":{"message":"Resets in 60 days"}}`)
+	d := cooldownFor(http.StatusTooManyRequests, "", body)
 	if d != cooldownMax {
-		t.Fatalf("Resets in 23hr -> %v, want capped %v", d, cooldownMax)
+		t.Fatalf("Resets in 60 days -> %v, want capped %v", d, cooldownMax)
 	}
 }
 
@@ -198,6 +242,8 @@ func TestForwardOpencodeGoSkipsCooledKey(t *testing.T) {
 }
 
 // After the cooldown expires the key is probed again — never forgotten.
+// With sticky rotation this only happens when the current lead is also
+// exhausted (all keys cooling), so the recovered key re-enters rotation.
 func TestForwardOpencodeGoExpiredCooldownReProbes(t *testing.T) {
 	ResetRotationForTest()
 	var k1Hits int32
@@ -205,10 +251,11 @@ func TestForwardOpencodeGoExpiredCooldownReProbes(t *testing.T) {
 		if r.Header.Get("Authorization") == "Bearer k1" {
 			atomic.AddInt32(&k1Hits, 1)
 			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte(`{"type":"error","error":{"type":"GoUsageLimitError","message":"Resets in 1 day"}}`))
+			w.Write([]byte(`{"type":"error","error":{"type":"GoUsageLimitError","message":"Resets in 30 min"}}`))
 			return
 		}
-		w.Write([]byte(`{"ok":true}`))
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"type":"error","error":{"type":"GoUsageLimitError","message":"Resets in 30 min"}}`))
 	}))
 	defer upstreamSrv.Close()
 
@@ -218,23 +265,73 @@ func TestForwardOpencodeGoExpiredCooldownReProbes(t *testing.T) {
 	}
 	us := Upstream{Type: "opencode-go", BaseURL: upstreamSrv.URL, URLPattern: "/chat/completions"}
 
-	// Burn the cooldown: first request fails k1 -> cools.
+	// Both keys exhausted on the first request -> both cool down.
 	rec1 := httptest.NewRecorder()
 	ForwardOpencodeGo(rec1, httptest.NewRequest(http.MethodPost, "/chat/completions", nil), []byte(`{"model":"x"}`), us, providers)
 	if got := atomic.LoadInt32(&k1Hits); got != 1 {
 		t.Fatalf("k1 hits after first request = %d, want 1", got)
 	}
-	// Force expiry.
+	// Force k1's cooldown expiry while k2 is still cooling.
 	providers[0].cooldownUntil.Store(time.Now().Add(-time.Second).UnixNano())
 
-	// Next request must probe k1 again (cooldown over).
+	// Next request must probe k1 again (its cooldown is over, it is the
+	// only non-cooling key), then fail over to cooling k2.
 	rec2 := httptest.NewRecorder()
 	ForwardOpencodeGo(rec2, httptest.NewRequest(http.MethodPost, "/chat/completions", nil), []byte(`{"model":"x"}`), us, providers)
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("second request status = %d, want 200 (body: %s)", rec2.Code, rec2.Body.String())
-	}
 	if got := atomic.LoadInt32(&k1Hits); got != 2 {
-		t.Fatalf("k1 hits after cooldown expiry = %d, want 2 (key re-probed)", got)
+		t.Fatalf("k1 hits after cooldown expiry = %d, want 2 (recovered key re-probed)", got)
+	}
+}
+
+// Sticky exhaustion end-to-end: k1 burns out, k2 takes over, and even after
+// k1's cooldown expires it does NOT steal traffic back — k2 stays the lead
+// until IT burns out. This is what keeps the upstream key session (and its
+// prompt cache) alive.
+func TestForwardOpencodeGoStickyKeepsLeadAfterRecovery(t *testing.T) {
+	ResetRotationForTest()
+	var k1Hits, k2Hits int32
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer k1":
+			atomic.AddInt32(&k1Hits, 1)
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"type":"error","error":{"type":"GoUsageLimitError","message":"Resets in 30 min"}}`))
+		case "Bearer k2":
+			atomic.AddInt32(&k2Hits, 1)
+			w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer upstreamSrv.Close()
+
+	providers := []Provider{
+		{Name: "opencode-go-1", Family: "opencode-go", Key: "k1"},
+		{Name: "opencode-go-2", Family: "opencode-go", Key: "k2"},
+	}
+	us := Upstream{Type: "opencode-go", BaseURL: upstreamSrv.URL, URLPattern: "/chat/completions"}
+
+	// Request 1: k1 exhausted, k2 succeeds and becomes the lead.
+	rec1 := httptest.NewRecorder()
+	ForwardOpencodeGo(rec1, httptest.NewRequest(http.MethodPost, "/chat/completions", nil), []byte(`{"model":"x"}`), us, providers)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("request 1 status = %d, want 200", rec1.Code)
+	}
+
+	// k1's cooldown expires (e.g. 30-min window reset).
+	providers[0].cooldownUntil.Store(time.Now().Add(-time.Second).UnixNano())
+
+	// Requests 2..4 must ALL stay on k2 — k1 is available but not the lead.
+	for i := 2; i <= 4; i++ {
+		rec := httptest.NewRecorder()
+		ForwardOpencodeGo(rec, httptest.NewRequest(http.MethodPost, "/chat/completions", nil), []byte(`{"model":"x"}`), us, providers)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d, want 200", i, rec.Code)
+		}
+	}
+	if got := atomic.LoadInt32(&k1Hits); got != 1 {
+		t.Fatalf("k1 hits = %d, want 1 (recovered key must not steal traffic)", got)
+	}
+	if got := atomic.LoadInt32(&k2Hits); got != 4 {
+		t.Fatalf("k2 hits = %d, want 4 (sticky lead must burn until exhausted)", got)
 	}
 }
 

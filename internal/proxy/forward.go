@@ -3,11 +3,23 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
+)
+
+// upstreamProxy holds the optional upstream-routing proxy parsed at startup
+// from the routing config (proxy.url) or the LLM_PROXY_HTTP_PROXY env var.
+// Populated by LoadUpstreamProxy(); consumed by forward() via proxyURLForFamily().
+var (
+	upstreamProxyMu   sync.RWMutex
+	upstreamProxyFor  map[string]*url.URL // family -> *url.URL; nil entry == direct
 )
 
 // --- proxy engine: forward to upstream, with optional two-key failover ---
@@ -20,13 +32,25 @@ import (
 // (r.Context()), which also cancels the upstream request when the client
 // disconnects. A fresh transport per call keeps a wedged keep-alive
 // connection from poisoning later requests.
-func upstreamClient(timeoutS int) (*http.Client, *http.Transport) {
+//
+// proxyURL is an optional upstream-routing proxy (e.g. mihomo on
+// 127.0.0.1:7897); nil means dial the upstream directly.
+func upstreamClient(timeoutS int, proxyURL *url.URL) (*http.Client, *http.Transport) {
 	d := time.Duration(timeoutS) * time.Second
 	if d <= 0 {
 		d = upstreamHeaderTimeout
 	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ResponseHeaderTimeout = d
+	// http.DefaultTransport.Proxy defaults to http.ProxyFromEnvironment
+	// (not nil), so a freshly-cloned transport inherits it. Without a
+	// nil-cleared Proxy, a "no proxy configured" code path still hits
+	// HTTPS_PROXY/HTTP_PROXY/no_proxy env vars — bypassing the proxy
+	// contract entirely. Reset to nil by default; opt back in explicitly.
+	tr.Proxy = nil
+	if proxyURL != nil {
+		tr.Proxy = http.ProxyURL(proxyURL)
+	}
 	return &http.Client{Transport: tr}, tr
 }
 
@@ -49,6 +73,10 @@ func forward(cfg *Config, w http.ResponseWriter, r *http.Request, body []byte, d
 		ForwardOpencodeGo(w, r, body, us, providers)
 	case "opencode-zen":
 		ForwardOpencodeZen(w, r, body, us, providers)
+	case "ollama":
+		ForwardOllama(w, r, body, us, providers)
+	case "openrouter":
+		ForwardOpenrouter(w, r, body, us, providers)
 	case "passthrough":
 		ForwardPassthrough(w, r, body, us)
 	default:
@@ -58,9 +86,9 @@ func forward(cfg *Config, w http.ResponseWriter, r *http.Request, body []byte, d
 }
 
 func ForwardMinimax(w http.ResponseWriter, r *http.Request, body []byte, us Upstream, providers []Provider) {
-	httpClient, tr := upstreamClient(us.TimeoutS)
+	httpClient, tr := upstreamClient(us.TimeoutS, proxyURLForFamily(us.Type))
 	defer tr.CloseIdleConnections()
-	upstreamURL := us.BaseURL
+	upstreamURL := JoinTarget(us.BaseURL, us.URLPattern)
 	ptrs := make([]*Provider, len(providers))
 	for i := range providers {
 		ptrs[i] = &providers[i]
@@ -229,7 +257,7 @@ func SanitizeEmptyAssistantMessages(body []byte) []byte {
 
 func ForwardOpencodeGo(w http.ResponseWriter, r *http.Request, body []byte, us Upstream, providers []Provider) {
 	body = SanitizeEmptyAssistantMessages(body)
-	httpClient, tr := upstreamClient(us.TimeoutS)
+	httpClient, tr := upstreamClient(us.TimeoutS, proxyURLForFamily(us.Type))
 	defer tr.CloseIdleConnections()
 	target := JoinTarget(us.BaseURL, us.URLPattern)
 	var keys []*Provider
@@ -306,6 +334,13 @@ func ForwardOpencodeGo(w http.ResponseWriter, r *http.Request, body []byte, us U
 			resp.Body.Close()
 			if streamErr != nil {
 				log.Printf("opencode-go provider=%s stream err: %v", p.Name, streamErr)
+			}
+			if strings.HasSuffix(target, "/chat/completions") {
+				// OpenAI-shape clients (DeepSeek chat-completions adapters)
+				// require the terminating `data: [DONE]` event; the opencode-go
+				// upstream ends its SSE body without one, so append it.
+				// Anthropic-shape clients (/v1/messages) must not see it.
+				fw.Write([]byte("data: [DONE]\n\n"))
 			}
 			return
 		}
@@ -396,51 +431,178 @@ func ForwardOpencodeGo(w http.ResponseWriter, r *http.Request, body []byte, us U
 }
 
 func ForwardOpencodeZen(w http.ResponseWriter, r *http.Request, body []byte, us Upstream, providers []Provider) {
-	var zen *Provider
+	target := JoinTarget(us.BaseURL, us.URLPattern)
+	var keys []*Provider
 	for i := range providers {
 		if providers[i].Family == "opencode-zen" {
-			zen = &providers[i]
+			keys = append(keys, &providers[i])
+		}
+	}
+	if len(keys) == 0 {
+		log.Printf("opencode-zen: no OPENCODE_ZEN_KEY[_N] providers configured")
+		http.Error(w, "opencode-zen: no keys configured", http.StatusBadGateway)
+		return
+	}
+	sawTimeout := false
+	badRequestCount := 0
+	var firstBadRequestBody []byte
+	for i, p := range buildAttemptOrder("opencode-zen", keys) {
+		log.Printf("opencode-zen attempt %d/%d: provider=%s target=%s bytes=%d", i+1, len(keys), p.Name, target, len(body))
+		httpClient, tr := upstreamClient(us.TimeoutS, proxyURLForFamily(us.Type))
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+p.Key)
+		if strings.HasSuffix(target, "/messages") {
+			req.Header.Set("x-api-key", p.Key)
+			req.Header.Set("anthropic-version", "2023-06-01")
+			if v := r.Header.Get("anthropic-beta"); v != "" {
+				req.Header.Set("anthropic-beta", v)
+			}
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			if clientGone(r) {
+				log.Printf("opencode-zen provider=%s aborted: client disconnected", p.Name)
+				tr.CloseIdleConnections()
+				return
+			}
+			sawTimeout = true
+			log.Printf("opencode-zen provider=%s transport error: %v", p.Name, err)
+			p.Stats.observe(0)
+			p.Stats.recordFailover()
+			setCooldown(p, 0, "", nil)
+			tr.CloseIdleConnections()
+			continue
+		}
+		p.Stats.observe(resp.StatusCode)
+		ct := resp.Header.Get("Content-Type")
+		isSSE := strings.Contains(strings.ToLower(ct), "text/event-stream")
+		const peekCap = 4096
+		peek := make([]byte, 0, peekCap)
+		tee := io.TeeReader(resp.Body, &PeekBuf{Peek: &peek, Cap: peekCap})
+		if isSSE {
+			markKeySuccess("opencode-zen", p)
+			CopyHeaders(w.Header(), resp.Header)
+			if !ContainsHeader(resp.Header, "X-Accel-Buffering") {
+				w.Header().Set("X-Accel-Buffering", "no")
+			}
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(resp.StatusCode)
+			fw := newFlushWriter(w)
+			if len(peek) > 0 {
+				if _, werr := fw.Write(peek); werr != nil {
+					resp.Body.Close()
+					log.Printf("opencode-zen provider=%s write err: %v", p.Name, werr)
+					tr.CloseIdleConnections()
+					return
+				}
+			}
+			streamErr := StreamSSE(fw, tee)
+			resp.Body.Close()
+			if streamErr != nil {
+				log.Printf("opencode-zen provider=%s stream err: %v", p.Name, streamErr)
+			}
+			tr.CloseIdleConnections()
+			return
+		}
+		n, _ := io.ReadFull(tee, make([]byte, peekCap))
+		firstChunk := append([]byte(nil), peek[:n]...)
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusBadRequest {
+			log.Printf("opencode-zen provider=%s returned %d, retrying next: %s", p.Name, resp.StatusCode, firstChunk)
+			p.Stats.recordFailover()
+			setCooldown(p, resp.StatusCode, resp.Header.Get("Retry-After"), firstChunk)
+			if resp.StatusCode == http.StatusBadRequest {
+				badRequestCount++
+				if firstBadRequestBody == nil {
+					firstBadRequestBody = append([]byte(nil), firstChunk...)
+				}
+			}
+			resp.Body.Close()
+			tr.CloseIdleConnections()
+			continue
+		}
+		markKeySuccess("opencode-zen", p)
+		CopyHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		if len(firstChunk) > 0 {
+			w.Write(firstChunk)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		if n < peekCap {
+			resp.Body.Close()
+			log.Printf("opencode-zen provider=%s done (buffered %d bytes)", p.Name, n)
+			tr.CloseIdleConnections()
+			return
+		}
+		log.Printf("opencode-zen provider=%s streaming rest", p.Name)
+		_, copyErr := io.Copy(w, resp.Body)
+		resp.Body.Close()
+		if copyErr != nil {
+			log.Printf("opencode-zen provider=%s copy err: %v", p.Name, copyErr)
+		}
+		tr.CloseIdleConnections()
+		return
+	}
+	if sawTimeout {
+		log.Printf("opencode-zen: all keys failed on timeout/transport errors")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGatewayTimeout)
+		w.Write([]byte(`{"type":"error","error":{"type":"api_error","message":"llm-proxy: all opencode-zen keys timed out"}}`))
+		return
+	}
+	if badRequestCount == len(keys) {
+		log.Printf("opencode-zen: all keys rejected request with 400")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		if len(firstBadRequestBody) > 0 {
+			w.Write(firstBadRequestBody)
+		} else {
+			w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"llm-proxy: all opencode-zen keys rejected the request (400)"}}`))
+		}
+		return
+	}
+	log.Printf("opencode-zen: all keys exhausted (401/403/429/400)")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"llm-proxy: all opencode-zen keys exhausted"}}`))
+}
+
+func ForwardOllama(w http.ResponseWriter, r *http.Request, body []byte, us Upstream, providers []Provider) {
+	var ollama *Provider
+	for i := range providers {
+		if providers[i].Family == "ollama" {
+			ollama = &providers[i]
 			break
 		}
 	}
-	if zen == nil {
-		log.Printf("opencode-zen: no OPENCODE_ZEN_KEY configured")
-		http.Error(w, "opencode-zen: no key configured", http.StatusBadGateway)
+	if ollama == nil {
+		log.Printf("ollama: no OLLAMA_API_KEY configured")
+		http.Error(w, "ollama: no key configured", http.StatusBadGateway)
 		return
 	}
 	target := JoinTarget(us.BaseURL, us.URLPattern)
-	log.Printf("opencode-zen: provider=%s target=%s model=%s bytes=%d", zen.Name, target, us.Model, len(body))
+	log.Printf("ollama: provider=%s target=%s model=%s bytes=%d", ollama.Name, target, us.Model, len(body))
 
-	httpClient, tr := upstreamClient(us.TimeoutS)
+	httpClient, tr := upstreamClient(us.TimeoutS, proxyURLForFamily(us.Type))
 	defer tr.CloseIdleConnections()
 	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+zen.Key)
-	if v := r.Header.Get("anthropic-version"); v != "" {
-		req.Header.Set("anthropic-version", v)
-	}
-	if v := r.Header.Get("anthropic-beta"); v != "" {
-		req.Header.Set("anthropic-beta", v)
-	}
-	// The upstream zen /v1/messages (Anthropic-style) endpoint authenticates
-	// by x-api-key, not Authorization. Never forward the client's header here:
-	// opencode sends a dummy apiKey ("proxy-handles-auth") that would 401 the
-	// upstream. Always present the real zen key (same pattern as ForwardMinimax
-	// and ForwardOpencodeGo).
-	req.Header.Set("x-api-key", zen.Key)
+	req.Header.Set("Authorization", "Bearer "+ollama.Key)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		if clientGone(r) {
-			log.Printf("opencode-zen: aborted: client disconnected")
+			log.Printf("ollama: aborted: client disconnected")
 			return
 		}
-		log.Printf("opencode-zen: transport error: %v", err)
-		http.Error(w, "opencode-zen: "+err.Error(), http.StatusBadGateway)
+		log.Printf("ollama: transport error: %v", err)
+		http.Error(w, "ollama: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	zen.Stats.observe(resp.StatusCode)
+	ollama.Stats.observe(resp.StatusCode)
 
 	ct := resp.Header.Get("Content-Type")
 	isSSE := strings.Contains(strings.ToLower(ct), "text/event-stream")
@@ -460,6 +622,7 @@ func ForwardOpencodeZen(w http.ResponseWriter, r *http.Request, body []byte, us 
 			fw.Write(peek)
 		}
 		StreamSSE(fw, tee)
+		fw.Write([]byte("data: [DONE]\n\n"))
 		return
 	}
 
@@ -467,12 +630,165 @@ func ForwardOpencodeZen(w http.ResponseWriter, r *http.Request, body []byte, us 
 	w.WriteHeader(resp.StatusCode)
 	_, copyErr := io.Copy(w, resp.Body)
 	if copyErr != nil {
-		log.Printf("opencode-zen: copy err: %v", copyErr)
+		log.Printf("ollama: copy err: %v", copyErr)
 	}
 }
 
-func ForwardPassthrough(w http.ResponseWriter, r *http.Request, body []byte, us Upstream) {
-	httpClient, tr := upstreamClient(us.TimeoutS)
+// ForwardOpenrouter forwards to openrouter.ai's /v1/messages endpoint.
+// Same multi-key rotation as ForwardOpencodeGo (sticky + cooldown), but the
+// upstream serves an Anthropic-shaped protocol — no SanitizeEmptyAssistantMessages,
+// no trailing "data: [DONE]\n\n". Both Authorization: Bearer and x-api-key
+// are set so the proxy works regardless of which auth scheme openrouter
+// accepts in a given code path.
+func ForwardOpenrouter(w http.ResponseWriter, r *http.Request, body []byte, us Upstream, providers []Provider) {
+	httpClient, tr := upstreamClient(us.TimeoutS, proxyURLForFamily(us.Type))
+	defer tr.CloseIdleConnections()
+	target := JoinTarget(us.BaseURL, us.URLPattern)
+	var keys []*Provider
+	for i := range providers {
+		if providers[i].Family == "openrouter" {
+			keys = append(keys, &providers[i])
+		}
+	}
+	if len(keys) == 0 {
+		log.Printf("openrouter: no OPENROUTER_KEY_N providers configured")
+		http.Error(w, "openrouter: no keys configured", http.StatusBadGateway)
+		return
+	}
+	sawTimeout := false
+	badRequestCount := 0
+	var firstBadRequestBody []byte
+	for i, p := range buildAttemptOrder("openrouter", keys) {
+		log.Printf("openrouter attempt %d/%d: provider=%s target=%s bytes=%d", i+1, len(keys), p.Name, target, len(body))
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+p.Key)
+		req.Header.Set("x-api-key", p.Key)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		if v := r.Header.Get("anthropic-beta"); v != "" {
+			req.Header.Set("anthropic-beta", v)
+		}
+		// Optional attribution headers recommended by openrouter.ai — kept
+		// short, no PII; helps openrouter route abuse reports back here
+		// instead of banning the key.
+		req.Header.Set("HTTP-Referer", "https://llm-proxy.local")
+		req.Header.Set("X-Title", "llm-proxy")
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			if clientGone(r) {
+				log.Printf("openrouter provider=%s aborted: client disconnected", p.Name)
+				return
+			}
+			sawTimeout = true
+			log.Printf("openrouter provider=%s transport error: %v", p.Name, err)
+			p.Stats.observe(0)
+			p.Stats.recordFailover()
+			setCooldown(p, 0, "", nil)
+			continue
+		}
+		p.Stats.observe(resp.StatusCode)
+
+		ct := resp.Header.Get("Content-Type")
+		isSSE := strings.Contains(strings.ToLower(ct), "text/event-stream")
+
+		const peekCap = 4096
+		peek := make([]byte, 0, peekCap)
+		tee := io.TeeReader(resp.Body, &PeekBuf{Peek: &peek, Cap: peekCap})
+
+		if isSSE {
+			markKeySuccess("openrouter", p)
+			CopyHeaders(w.Header(), resp.Header)
+			if !ContainsHeader(resp.Header, "X-Accel-Buffering") {
+				w.Header().Set("X-Accel-Buffering", "no")
+			}
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(resp.StatusCode)
+			fw := newFlushWriter(w)
+			if len(peek) > 0 {
+				if _, werr := fw.Write(peek); werr != nil {
+					resp.Body.Close()
+					log.Printf("openrouter provider=%s write err: %v", p.Name, werr)
+					return
+				}
+			}
+			streamErr := StreamSSE(fw, tee)
+			resp.Body.Close()
+			if streamErr != nil {
+				log.Printf("openrouter provider=%s stream err: %v", p.Name, streamErr)
+			}
+			return
+		}
+
+		n, _ := io.ReadFull(tee, make([]byte, peekCap))
+		firstChunk := append([]byte(nil), peek[:n]...)
+
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusBadRequest {
+			log.Printf("openrouter provider=%s returned %d, retrying next: %s", p.Name, resp.StatusCode, firstChunk)
+			p.Stats.recordFailover()
+			setCooldown(p, resp.StatusCode, resp.Header.Get("Retry-After"), firstChunk)
+			if resp.StatusCode == http.StatusBadRequest {
+				badRequestCount++
+				if firstBadRequestBody == nil {
+					firstBadRequestBody = append([]byte(nil), firstChunk...)
+				}
+			}
+			resp.Body.Close()
+			continue
+		}
+
+		markKeySuccess("openrouter", p)
+		CopyHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		if len(firstChunk) > 0 {
+			w.Write(firstChunk)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+
+		if n < peekCap {
+			resp.Body.Close()
+			log.Printf("openrouter provider=%s done (buffered %d bytes)", p.Name, n)
+			return
+		}
+
+		log.Printf("openrouter provider=%s streaming rest", p.Name)
+		_, copyErr := io.Copy(w, resp.Body)
+		resp.Body.Close()
+		if copyErr != nil {
+			log.Printf("openrouter provider=%s copy err: %v", p.Name, copyErr)
+		}
+		return
+	}
+
+	if sawTimeout {
+		log.Printf("openrouter: all keys failed on timeout/transport errors")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGatewayTimeout)
+		w.Write([]byte(`{"type":"error","error":{"type":"api_error","message":"llm-proxy: all openrouter keys timed out"}}`))
+		return
+	}
+
+	if badRequestCount == len(keys) {
+		log.Printf("openrouter: all keys rejected request with 400")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		if len(firstBadRequestBody) > 0 {
+			w.Write(firstBadRequestBody)
+		} else {
+			w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"llm-proxy: all openrouter keys rejected the request (400)"}}`))
+		}
+		return
+	}
+
+	log.Printf("openrouter: all keys exhausted (401/403/429/400)")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"llm-proxy: all openrouter keys exhausted"}}`))
+}
+
+func ForwardPassthrough(w http.ResponseWriter, r *http.Request, body []byte, us Upstream) {	httpClient, tr := upstreamClient(us.TimeoutS, proxyURLForFamily(us.Type))
 	defer tr.CloseIdleConnections()
 	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, us.BaseURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", r.Header.Get("Content-Type"))
@@ -488,4 +804,113 @@ func ForwardPassthrough(w http.ResponseWriter, r *http.Request, body []byte, us 
 	CopyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// UpstreamProxySpec describes one upstream-routing proxy entry from the
+// routing config's proxy.for[] list. Only the families in For get dialed
+// through URL; everything else dials directly.
+type UpstreamProxySpec struct {
+	URL string   `yaml:"url"`
+	For []string `yaml:"for"`
+}
+
+// LoadUpstreamProxy parses proxy URLs and stores them in a per-family lookup.
+// Routing precedence (first match wins per family):
+//  1. env LLM_PROXY_HTTP_PROXY_FAMILY_<FAMILY>=<url>  (most specific)
+//  2. env LLM_PROXY_HTTP_PROXY=<url>                   (fallback default)
+//  3. config proxy.for[] entries (parsed earlier and passed in)
+func LoadUpstreamProxy(envDefault string, specs []UpstreamProxySpec) error {
+	families := []string{"minimax", "opencode-go", "opencode-zen", "ollama", "openrouter", "passthrough"}
+	lookup := map[string]*url.URL{}
+
+	add := func(family, raw string) error {
+		if raw == "" {
+			return nil
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("invalid proxy url for %s: %w", family, err)
+		}
+		if u.Scheme != "http" && u.Scheme != "socks5" {
+			return fmt.Errorf("proxy scheme %q for %s not supported (use http:// or socks5://)", u.Scheme, family)
+		}
+		lookup[family] = u
+		return nil
+	}
+
+	for _, s := range specs {
+		var parsed *url.URL
+		var firstErr error
+		for _, family := range s.For {
+			if _, exists := lookup[family]; exists {
+				continue
+			}
+			if parsed == nil {
+				u, err := url.Parse(s.URL)
+				if err != nil {
+					if firstErr == nil {
+						firstErr = fmt.Errorf("invalid proxy url %q: %w", s.URL, err)
+					}
+					continue
+				}
+				if u.Scheme != "http" && u.Scheme != "socks5" {
+					if firstErr == nil {
+						firstErr = fmt.Errorf("proxy scheme %q not supported (use http:// or socks5://)", u.Scheme)
+					}
+					continue
+				}
+				parsed = u
+			}
+			lookup[family] = parsed
+		}
+		if firstErr != nil && parsed == nil {
+			return firstErr
+		}
+	}
+
+	for _, family := range families {
+		if _, exists := lookup[family]; !exists {
+			if err := add(family, envDefault); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, family := range families {
+		key := "LLM_PROXY_HTTP_PROXY_FAMILY_" + strings.ToUpper(strings.ReplaceAll(family, "-", "_"))
+		if err := add(family, os.Getenv(key)); err != nil {
+			return err
+		}
+	}
+
+	upstreamProxyMu.Lock()
+	upstreamProxyFor = lookup
+	upstreamProxyMu.Unlock()
+	for f, u := range lookup {
+		if u != nil {
+			log.Printf("llm-proxy: routing %s through %s://%s%s", f, u.Scheme, u.Host, u.Path)
+		}
+	}
+	return nil
+}
+
+func proxyURLForFamily(family string) *url.URL {
+	upstreamProxyMu.RLock()
+	defer upstreamProxyMu.RUnlock()
+	return upstreamProxyFor[family]
+}
+
+// ResetUpstreamProxyForTest clears the proxy lookup. Test-only.
+func ResetUpstreamProxyForTest() {
+	upstreamProxyMu.Lock()
+	upstreamProxyFor = map[string]*url.URL{}
+	upstreamProxyMu.Unlock()
+}
+
+// UpstreamProxyURLForFamily is the exported form of proxyURLForFamily, for tests.
+func UpstreamProxyURLForFamily(family string) *url.URL { return proxyURLForFamily(family) }
+
+// UpstreamClientForTest exposes upstreamClient for tests.
+func UpstreamClientForTest(timeoutS int, family string) (*http.Client, *http.Transport) {
+	return upstreamClient(timeoutS, proxyURLForFamily(family))
 }

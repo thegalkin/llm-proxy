@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"llm-proxy/internal/proxy"
@@ -220,16 +221,29 @@ func TestRoutingTargetURL(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			us := c.ResolveRule(tc.key)
-			var got string
-			if us.Type == "minimax" {
-				got = us.BaseURL
-			} else {
-				got = proxy.JoinTarget(us.BaseURL, us.URLPattern)
-			}
+			got := proxy.JoinTarget(us.BaseURL, us.URLPattern)
 			if got != tc.want {
 				t.Errorf("rule %q -> target %q, want %q (type=%s)", tc.key, got, tc.want, us.Type)
 			}
 		})
+	}
+}
+
+// Regression for the doubled-"/v1/messages" URL bug. The bug surfaced
+// when DefaultMinimaxURL still included "/v1/messages" and was then fed
+// through JoinTarget with pattern="/v1/messages" again, producing
+// ".../v1/messages/v1/messages" and 401-ing on real traffic.
+func TestMinimaxBaseURLNoVersionSufix(t *testing.T) {
+	if strings.Contains(proxy.DefaultMinimaxURL, "/v1/messages") {
+		t.Fatalf("DefaultMinimaxURL must not carry the endpoint path; got %q (forbidden suffix collides with JoinTarget)", proxy.DefaultMinimaxURL)
+	}
+	if !strings.HasSuffix(proxy.DefaultMinimaxURL, "/anthropic") {
+		t.Fatalf("DefaultMinimaxURL must stay on the /anthropic base; got %q", proxy.DefaultMinimaxURL)
+	}
+	got := proxy.JoinTarget(proxy.DefaultMinimaxURL, "/v1/messages")
+	want := "https://api.minimax.io/anthropic/v1/messages"
+	if got != want {
+		t.Errorf("JoinTarget(MinimaxBase, %q) = %q, want %q", "/v1/messages", got, want)
 	}
 }
 

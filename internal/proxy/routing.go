@@ -41,7 +41,12 @@ func Decide(cfg *Config, body []byte, requestPath string, hostProvider string) R
 	us := cfg.ResolveRule(key)
 	rd := RoutingDecision{Upstream: us, RuleName: key}
 
-	if us.URLPattern == "" || us.URLPattern == "/chat/completions" {
+	// Only Anthropic clients (POST /v1/messages) may flip the upstream to the
+	// Anthropic endpoint. OpenAI clients on /v1/chat/completions must keep the
+	// OpenAI URL even when their body carries content-part arrays ({"type":"text"})
+	// — those are valid in OpenAI bodies too, and flipping would make the proxy
+	// return an Anthropic-shaped response that OpenAI clients cannot parse.
+	if (us.URLPattern == "" || us.URLPattern == "/chat/completions") && strings.HasSuffix(requestPath, "/messages") {
 		if detectAnthropicShape(body) {
 			us.URLPattern = "/v1/messages"
 			rd.Upstream = us
@@ -56,11 +61,13 @@ func Decide(cfg *Config, body []byte, requestPath string, hostProvider string) R
 			return rd
 		}
 		rd.RewrittenBody = newBody
-	} else if model != "" && (us.Type == "opencode-go" || us.Type == "opencode-zen") {
+	} else if model != "" && (us.Type == "opencode-go" || us.Type == "opencode-zen" || us.Type == "openrouter") {
 		// Strip a leading "<provider>/" or "<provider>/zen/" prefix from
 		// the body model — these upstreams serve bare names like
 		// "deepseek-v4-flash" or "big-pickle" and reject the prefixed
 		// form with 401 ModelError. Anthropic keeps the bare name.
+		// openrouter also receives the bare "<vendor>/<name>" id (the
+		// slash inside the id is part of the name and must stay).
 		prefixes := []string{us.Type + "/zen/", us.Type + "/"}
 		bare := model
 		for _, p := range prefixes {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -35,6 +36,7 @@ func HandleMessages(cfg *Config, providers []Provider) http.HandlerFunc {
 		r.Body.Close()
 		decision := Decide(cfg, body, r.URL.Path, "minimax")
 		w.Header().Set(HeaderRoutingTag, decision.Upstream.Type+":"+decision.RuleName)
+		log.Printf("msg: client=%s bytes=%d model=%q route=%s upstream=%s", r.URL.Path, len(body), modelFromBody(body), decision.RuleName, JoinTarget(decision.Upstream.BaseURL, decision.Upstream.URLPattern))
 		forward(cfg, w, r, decision.RewrittenBody, decision, providers)
 	}
 }
@@ -59,6 +61,7 @@ func handleChatCompletions(cfg *Config, providers []Provider) http.HandlerFunc {
 		// and selects the matching upstream.
 		decision := Decide(cfg, body, r.URL.Path, "opencode-go")
 		w.Header().Set(HeaderRoutingTag, decision.Upstream.Type+":"+decision.RuleName)
+		log.Printf("chat: client=%s bytes=%d model=%q route=%s upstream=%s", r.URL.Path, len(body), modelFromBody(body), decision.RuleName, JoinTarget(decision.Upstream.BaseURL, decision.Upstream.URLPattern))
 		forward(cfg, w, r, decision.RewrittenBody, decision, providers)
 	}
 }
@@ -179,11 +182,19 @@ type quotaWindow struct {
 }
 
 type providerQuota struct {
-	OK        bool        `json:"ok"`
-	Error     string      `json:"error,omitempty"`
-	SourceURL string      `json:"source_url,omitempty"`
-	FiveH     quotaWindow `json:"five_h"`
-	Weekly    quotaWindow `json:"weekly"`
+	OK           bool        `json:"ok"`
+	Error        string      `json:"error,omitempty"`
+	SourceURL    string      `json:"source_url,omitempty"`
+	FiveH        quotaWindow `json:"five_h"`
+	Weekly       quotaWindow `json:"weekly"`
+	Subscription subInfo     `json:"subscription"`
+}
+
+type subInfo struct {
+	ResetInS    *int64  `json:"weekly_resets_in_s,omitempty"`
+	ResetAtUnix *int64  `json:"weekly_reset_at_unix,omitempty"`
+	ResetAtISO  *string `json:"weekly_reset_at_iso,omitempty"`
+	WindowHours *int    `json:"window_hours,omitempty"`
 }
 
 type ProviderReport struct {
@@ -193,12 +204,22 @@ type ProviderReport struct {
 }
 
 // probeProviderQuota fetches and parses the MiniMax token-plan quota for a
-// provider. Providers without a quota API (opencode-go) report an error.
+// provider. Providers without a quota API (opencode-go, openrouter, ollama)
+// report an error instead of trying to hit the MiniMax-specific endpoint.
 func ProbeProviderQuota(ctx context.Context, p *Provider) ProviderReport {
 	report := ProviderReport{Provider: p.Name, Stats: p.Stats, Quota: providerQuota{}}
-	if p.Family == "opencode-go" {
+	switch p.Family {
+	case "opencode-go":
 		report.Quota.OK = false
 		report.Quota.Error = "no public quota API (GoUsageLimitError surfaces on request)"
+		return report
+	case "openrouter":
+		report.Quota.OK = false
+		report.Quota.Error = "no public quota API (credits surface via openrouter.ai dashboard)"
+		return report
+	case "ollama":
+		report.Quota.OK = false
+		report.Quota.Error = "no public quota API (ollama cloud billing is per-account)"
 		return report
 	}
 	data, source, err := fetchQuotaRemains(ctx, p.Key)
@@ -296,6 +317,24 @@ func ParseQuotaPayload(data []byte, nowUnix int64) (providerQuota, error) {
 	fill(&quota.Weekly, "current_weekly_remaining_percent",
 		"current_weekly_total_count", "current_weekly_usage_count",
 		"current_weekly_status", "weekly_end_time", "weekly_start_time")
+	if e := toInt(general["weekly_end_time"]); e != nil {
+		endSec := (*e) / 1000
+		quota.Subscription.ResetAtUnix = &endSec
+		s := endSec - now
+		if s < 0 {
+			s = 0
+		}
+		quota.Subscription.ResetInS = &s
+		iso := time.Unix(endSec, 0).UTC().Format(time.RFC3339)
+		quota.Subscription.ResetAtISO = &iso
+	}
+	if ws := toInt(general["weekly_start_time"]); ws != nil {
+		we := quota.Subscription.ResetAtUnix
+		if we != nil {
+			hours := int((*we - *ws/1000) / 3600)
+			quota.Subscription.WindowHours = &hours
+		}
+	}
 	return quota, nil
 }
 
@@ -332,4 +371,13 @@ func doQuotaGet(client *http.Client, ctx context.Context, url, apiKey string) (*
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	return client.Do(req)
+}
+
+func modelFromBody(body []byte) string {
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return ""
+	}
+	s, _ := m["model"].(string)
+	return s
 }
