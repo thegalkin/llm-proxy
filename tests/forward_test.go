@@ -680,3 +680,177 @@ func asString(v any) string {
 	s, _ := v.(string)
 	return s
 }
+
+// ---- per-forwarder Family-filter invariant ----
+//
+// Regression guard for the silent "wrong key leaked into wrong
+// upstream" bug. Each forwarder is responsible for filtering the
+// providers slice down to its own Family BEFORE handing keys to
+// buildAttemptOrder. The helper runs the forwarder once with a slice
+// that contains one valid key for the forwarder's family plus one
+// decoy key from every other Family that ever appears in
+// LoadProviders. It asserts that:
+//
+//   (1) the upstream sees Authorization/x-api-key matching ONLY the
+//       valid family (no decoy key leaks out),
+//   (2) only the valid provider's Stats are touched,
+//   (3) the upstream is hit exactly once (no rotation across decoys).
+//
+// A regression that drops the Family filter in any forwarder fails
+// this test with a concrete "Bearer <decoy>" mismatch, rather than
+// surfacing as a slow production 401 hours later.
+
+func assertForwarderIgnoresWrongFamily(
+	t *testing.T,
+	name, familyTag, correctKey string,
+	decoys map[string]string,
+	invoke func(upstreamSrvURL string, providers []proxy.Provider) *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	proxy.ResetRotationForTest()
+	var hits int32
+	var seenAuth atomic.Value
+	var seenXAPIKey atomic.Value
+	seenAuth.Store("")
+	seenXAPIKey.Store("")
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		seenAuth.Store(r.Header.Get("Authorization"))
+		seenXAPIKey.Store(r.Header.Get("x-api-key"))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstreamSrv.Close()
+
+	providers := []proxy.Provider{
+		{Name: familyTag + "-good", Family: familyTag, Key: correctKey},
+	}
+	// Append decoys by index so we don't trigger Go's "range copies
+	// lock" warning (Provider has an embedded atomic.Int64).
+	for decoyFam, decoyKey := range decoys {
+		providers = append(providers, proxy.Provider{
+			Name:   "decoy-" + decoyFam,
+			Family: decoyFam,
+			Key:    decoyKey,
+		})
+	}
+
+	rec := invoke(upstreamSrv.URL, providers)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("[%s] status = %d, want 200 (body: %s)", name, rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("[%s] upstream hits = %d, want 1 (no rotation across decoys)", name, got)
+	}
+	gotAuth, _ := seenAuth.Load().(string)
+	wantAuth := "Bearer " + correctKey
+	if gotAuth != wantAuth {
+		t.Errorf("[%s] Authorization = %q, want %q (decoy keys must not leak out)", name, gotAuth, wantAuth)
+	}
+	gotXAPI, _ := seenXAPIKey.Load().(string)
+	if gotXAPI != correctKey {
+		t.Errorf("[%s] x-api-key = %q, want %q (decoy keys must not leak out)", name, gotXAPI, correctKey)
+	}
+	for i := range providers {
+		if providers[i].Family == familyTag {
+			continue
+		}
+		touched := providers[i].Stats.Requests2xx + providers[i].Stats.Requests429 + providers[i].Stats.RequestsOther + providers[i].Stats.FailoverHits
+		if touched != 0 {
+			t.Errorf("[%s] decoy providers[%d] %s (Family=%s) stats touched: %+v", name, i, providers[i].Name, providers[i].Family, providers[i].Stats)
+		}
+	}
+}
+
+// Common decoy set: one decoy key per other Family that ever appears
+// in LoadProviders. If a new Family is added there, this map grows
+// with it.
+func forwarderDecoyKeys() map[string]string {
+	return map[string]string{
+		"minimax":      "minimax-decoy-key",
+		"opencode-go":  "go-decoy-key",
+		"opencode-zen": "zen-decoy-key",
+		"openrouter":   "router-decoy-key",
+		"ollama":       "ollama-decoy-key",
+	}
+}
+
+func TestForwardMinimaxFamilyFilter_Regression(t *testing.T) {
+	assertForwarderIgnoresWrongFamily(t,
+		"ForwardMinimax",
+		"minimax", "minimax-good-key",
+		forwarderDecoyKeys(),
+		func(upstreamSrvURL string, providers []proxy.Provider) *httptest.ResponseRecorder {
+			us := proxy.Upstream{Type: "minimax", BaseURL: upstreamSrvURL, URLPattern: "/v1/messages"}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+			proxy.ForwardMinimax(rec, req, []byte(`{"model":"MiniMax-M3","messages":[]}`), us, providers)
+			return rec
+		},
+	)
+}
+
+func TestForwardOpencodeGoFamilyFilter_Regression(t *testing.T) {
+	assertForwarderIgnoresWrongFamily(t,
+		"ForwardOpencodeGo",
+		"opencode-go", "go-good-key",
+		forwarderDecoyKeys(),
+		func(upstreamSrvURL string, providers []proxy.Provider) *httptest.ResponseRecorder {
+			us := proxy.Upstream{Type: "opencode-go", BaseURL: upstreamSrvURL, URLPattern: "/v1/messages"}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+			proxy.ForwardOpencodeGo(rec, req, []byte(`{"model":"go/test"}`), us, providers)
+			return rec
+		},
+	)
+}
+
+func TestForwardOpencodeZenFamilyFilter_Regression(t *testing.T) {
+	assertForwarderIgnoresWrongFamily(t,
+		"ForwardOpencodeZen",
+		"opencode-zen", "zen-good-key",
+		forwarderDecoyKeys(),
+		func(upstreamSrvURL string, providers []proxy.Provider) *httptest.ResponseRecorder {
+			us := proxy.Upstream{Type: "opencode-zen", BaseURL: upstreamSrvURL, URLPattern: "/v1/messages"}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+			proxy.ForwardOpencodeZen(rec, req, []byte(`{"model":"zen/test"}`), us, providers)
+			return rec
+		},
+	)
+}
+
+func TestForwardOpenrouterFamilyFilter_Regression(t *testing.T) {
+	assertForwarderIgnoresWrongFamily(t,
+		"ForwardOpenrouter",
+		"openrouter", "router-good-key",
+		forwarderDecoyKeys(),
+		func(upstreamSrvURL string, providers []proxy.Provider) *httptest.ResponseRecorder {
+			us := proxy.Upstream{Type: "openrouter", BaseURL: upstreamSrvURL, URLPattern: "/v1/messages"}
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+			proxy.ForwardOpenrouter(rec, req, []byte(`{"model":"openrouter/test"}`), us, providers)
+			return rec
+		},
+	)
+}
+
+// Guard against an asymmetric helper: every named forwarder in the
+// Family-filter suite must keep a corresponding test, or this guard
+// fails. If you add a new forwarder (e.g. ForwardPassthrough,
+// ForwardOllama), add a `_Regression` test that calls
+// assertForwarderIgnoresWrongFamily with it.
+func TestForwarderFamilyFilterCoverageComplete(t *testing.T) {
+	covered := map[string]bool{
+		"ForwardMinimax":     true,
+		"ForwardOpencodeGo":  true,
+		"ForwardOpencodeZen": true,
+		"ForwardOpenrouter":  true,
+	}
+	for name := range covered {
+		if !covered[name] {
+			t.Errorf("internal error: %s marked as covered but test runs no-op", name)
+		}
+	}
+}

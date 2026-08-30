@@ -335,6 +335,61 @@ func TestForwardOpencodeGoStickyKeepsLeadAfterRecovery(t *testing.T) {
 	}
 }
 
+
+// The four forwarders (ForwardMinimax / ForwardOpencodeGo /
+// ForwardOpencodeZen / ForwardOpenrouter) all rely on this contract:
+// buildAttemptOrder NEVER filters by Family. Each forwarder is
+// responsible for filtering the providers slice down to its own family
+// before handing it to buildAttemptOrder. This test pins that
+// contract: handing a slice with mixed families must produce a slice
+// with the same mixed families back — only the order may change.
+//
+// A change to buildAttemptOrder that silently filters would not by
+// itself leak the wrong key (no filtering at all is also valid), but
+// this test locks in the "sort only" half of the contract that the
+// per-forwarder tests below rely on.
+func TestBuildAttemptOrderDoesNotFilterByFamily(t *testing.T) {
+	ResetRotationForTest()
+	ps := []*Provider{
+		{Name: "minimax-1", Family: "minimax"},
+		{Name: "zen-1", Family: "opencode-zen"},
+		{Name: "openrouter-1", Family: "openrouter"},
+		{Name: "go-1", Family: "opencode-go"},
+		{Name: "minimax-2", Family: "minimax"},
+	}
+	got := buildAttemptOrder("minimax", ps)
+	if len(got) != len(ps) {
+		t.Fatalf("buildAttemptOrder dropped providers: got %d, want %d (filtering belongs in the forwarder, not here)", len(got), len(ps))
+	}
+	families := make(map[string]int)
+	for _, p := range got {
+		families[p.Family]++
+	}
+	wantFamilies := map[string]int{
+		"minimax":     2,
+		"opencode-zen": 1,
+		"openrouter":   1,
+		"opencode-go":  1,
+	}
+	for fam, n := range wantFamilies {
+		if families[fam] != n {
+			t.Errorf("family %q count = %d, want %d (buildAttemptOrder must not filter; the forwarder does)", fam, families[fam], n)
+		}
+	}
+	for i, p := range ps {
+		found := false
+		for _, q := range got {
+			if q.Name == p.Name && q.Family == p.Family {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("input provider[%d] %s (Family=%s) missing from output (input: %v, output: %v)", i, p.Name, p.Family, names(ps), names(got))
+		}
+	}
+}
+
 func names(ps []*Provider) []string {
 	out := make([]string, len(ps))
 	for i, p := range ps {
