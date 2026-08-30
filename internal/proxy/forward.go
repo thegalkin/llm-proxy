@@ -18,8 +18,8 @@ import (
 // from the routing config (proxy.url) or the LLM_PROXY_HTTP_PROXY env var.
 // Populated by LoadUpstreamProxy(); consumed by forward() via proxyURLForFamily().
 var (
-	upstreamProxyMu   sync.RWMutex
-	upstreamProxyFor  map[string]*url.URL // family -> *url.URL; nil entry == direct
+	upstreamProxyMu  sync.RWMutex
+	upstreamProxyFor map[string]*url.URL // family -> *url.URL; nil entry == direct
 )
 
 // --- proxy engine: forward to upstream, with optional two-key failover ---
@@ -634,6 +634,36 @@ func ForwardOllama(w http.ResponseWriter, r *http.Request, body []byte, us Upstr
 	}
 }
 
+// rewriteModelInBody returns a copy of body with its top-level "model"
+// field replaced by newModel. Returns the original slice if the input
+// is not valid JSON or has no string "model" field. The pointer
+// identity of the returned slice (compared via &slice[0]) is what
+// ForwardOpenrouter uses to detect "no change happened": a fresh
+// allocation means the rewrite succeeded, the same backing array
+// means the helper refused to touch the body.
+func rewriteModelInBody(body []byte, newModel string) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body
+	}
+	if _, ok := m["model"].(string); !ok {
+		return body
+	}
+	m["model"] = newModel
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// RewriteModelInBodyForTest exports rewriteModelInBody so tests can
+// drive it directly without poking at the forwarding path. Not used
+// in production code.
+func RewriteModelInBodyForTest(body []byte, newModel string) []byte {
+	return rewriteModelInBody(body, newModel)
+}
+
 // ForwardOpenrouter forwards to openrouter.ai's /v1/messages endpoint.
 // Same multi-key rotation as ForwardOpencodeGo (sticky + cooldown), but the
 // upstream serves an Anthropic-shaped protocol — no SanitizeEmptyAssistantMessages,
@@ -655,12 +685,19 @@ func ForwardOpenrouter(w http.ResponseWriter, r *http.Request, body []byte, us U
 		http.Error(w, "openrouter: no keys configured", http.StatusBadGateway)
 		return
 	}
+	// reqBody is a private copy of the caller's body so the free-tier
+	// fallback (see the 404 branch below) can rewrite the "model" field
+	// without mutating the shared slice.
+	reqBody := append([]byte(nil), body...)
+	freeRewritten := false
 	sawTimeout := false
 	badRequestCount := 0
 	var firstBadRequestBody []byte
-	for i, p := range buildAttemptOrder("openrouter", keys) {
-		log.Printf("openrouter attempt %d/%d: provider=%s target=%s bytes=%d", i+1, len(keys), p.Name, target, len(body))
-		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
+	ordered := buildAttemptOrder("openrouter", keys)
+	for i := 0; i < len(ordered); i++ {
+		p := ordered[i]
+		log.Printf("openrouter attempt %d/%d: provider=%s target=%s bytes=%d", i+1, len(ordered), p.Name, target, len(reqBody))
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(reqBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+p.Key)
 		req.Header.Set("x-api-key", p.Key)
@@ -722,6 +759,41 @@ func ForwardOpenrouter(w http.ResponseWriter, r *http.Request, body []byte, us U
 
 		n, _ := io.ReadFull(tee, make([]byte, peekCap))
 		firstChunk := append([]byte(nil), peek[:n]...)
+
+		// Free-tier fallback: openrouter surfaces "This model is
+		// unavailable for free" with HTTP 404 when a previously-free
+		// model has been promoted to paid. Rewrite the model to
+		// "openrouter/free" (the curated free-tier router) and retry
+		// on the same key once. The key is not cooled down for this
+		// failure because the key itself is fine — only the model
+		// moved out of the free pool.
+		if resp.StatusCode == http.StatusNotFound && !freeRewritten && bytes.Contains(firstChunk, []byte("unavailable for free")) {
+			current := modelFromBody(reqBody)
+			if current != "openrouter/free" && current != "" {
+				log.Printf("openrouter provider=%s: free-tier model %q unavailable, rewriting to openrouter/free and retrying on same key", p.Name, current)
+				resp.Body.Close()
+				rewritten := rewriteModelInBody(reqBody, "openrouter/free")
+				if len(rewritten) == 0 || &rewritten[0] == &reqBody[0] {
+					// The helper refused the body (no string "model"
+					// field or invalid JSON). Surface the upstream 404
+					// verbatim rather than re-firing the same doomed
+					// request.
+					log.Printf("openrouter provider=%s: rewrite produced no change; surfacing upstream 404", p.Name)
+					CopyHeaders(w.Header(), resp.Header)
+					w.WriteHeader(http.StatusNotFound)
+					w.Write(firstChunk)
+					return
+				}
+				reqBody = rewritten
+				freeRewritten = true
+				// Replay this same provider index. The `for i := 0; ...`
+				// header increments i by one at the top of every
+				// iteration, so decrementing here re-binds p to the
+				// same provider on the next pass.
+				i--
+				continue
+			}
+		}
 
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusBadRequest {
 			log.Printf("openrouter provider=%s returned %d, retrying next: %s", p.Name, resp.StatusCode, firstChunk)
@@ -788,7 +860,8 @@ func ForwardOpenrouter(w http.ResponseWriter, r *http.Request, body []byte, us U
 	w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"llm-proxy: all openrouter keys exhausted"}}`))
 }
 
-func ForwardPassthrough(w http.ResponseWriter, r *http.Request, body []byte, us Upstream) {	httpClient, tr := upstreamClient(us.TimeoutS, proxyURLForFamily(us.Type))
+func ForwardPassthrough(w http.ResponseWriter, r *http.Request, body []byte, us Upstream) {
+	httpClient, tr := upstreamClient(us.TimeoutS, proxyURLForFamily(us.Type))
 	defer tr.CloseIdleConnections()
 	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, us.BaseURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", r.Header.Get("Content-Type"))

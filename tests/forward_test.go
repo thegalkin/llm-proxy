@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -456,4 +457,155 @@ func TestForwardOpencodeZenAllExhausted(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "all opencode-zen keys exhausted") {
 		t.Errorf("body = %q, want it to mention 'all opencode-zen keys exhausted'", rec.Body.String())
 	}
+}
+
+// rewriteModelInBody is a fresh allocation that swaps the top-level
+// "model" field. The original slice is kept for the pointer-identity
+// guard in ForwardOpenrouter.
+func TestRewriteModelInBody(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		to   string
+		want string
+	}{
+		{"plain", `{"model":"foo","messages":[]}`, "bar", `{"messages":[],"model":"bar"}`},
+		{"empty-input", `{}`, "openrouter/free", `{}`},
+		{"invalid-json", "not-json", "openrouter/free", "not-json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(proxy.RewriteModelInBodyForTest([]byte(tc.in), tc.to))
+			if got != tc.want {
+				t.Errorf("rewriteModelInBody(%q, %q) = %q, want %q", tc.in, tc.to, got, tc.want)
+			}
+		})
+	}
+	// Pointer identity must change on a real rewrite (so ForwardOpenrouter
+	// can detect "no change" via &reqBody[0] == &body[0]).
+	orig := []byte(`{"model":"x"}`)
+	rewritten := proxy.RewriteModelInBodyForTest(orig, "y")
+	if len(orig) == 0 || len(rewritten) == 0 {
+		t.Fatalf("unexpected empty slice from rewrite")
+	}
+	if &orig[0] == &rewritten[0] {
+		t.Errorf("rewrite returned the same backing array; pointer-identity guard would misfire")
+	}
+}
+
+// When openrouter says "This model is unavailable for free" on the first
+// attempt, ForwardOpenrouter rewrites the body to "openrouter/free" and
+// retries the same key. The second upstream response is what the client
+// sees. Without this, a paid-promotion of a previously-free model
+// (e.g. llama-3.3-70b) hard-breaks any client pinning that model id.
+func TestForwardOpenrouterFreeRewriteToRouter(t *testing.T) {
+	proxy.ResetRotationForTest()
+	var hits int32
+	var seenModels [2]atomic.Value
+	seenModels[0].Store("")
+	seenModels[1].Store("")
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		body, _ := io.ReadAll(r.Body)
+		var parsed map[string]any
+		_ = json.Unmarshal(body, &parsed)
+		seenModels[n-1].Store(asString(parsed["model"]))
+		if n == 1 {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"type":"error","error":{"type":"not_found_error","message":"This model is unavailable for free. The paid version is available now - use this slug instead: meta-llama/llama-3.3-70b-instruct","error_type":"not_found"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true,"model":"some-random-free-model"}`))
+	}))
+	defer upstreamSrv.Close()
+
+	providers := []proxy.Provider{{Name: "openrouter-1", Family: "openrouter", Key: "or-key"}}
+	us := proxy.Upstream{Type: "openrouter", BaseURL: upstreamSrv.URL, URLPattern: "/v1/messages"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+	req.Header.Set("anthropic-version", "2023-06-01")
+	bodyIn := []byte(`{"model":"meta-llama/llama-3.3-70b-instruct:free","messages":[{"role":"user","content":"ping"}]}`)
+	proxy.ForwardOpenrouter(rec, req, bodyIn, us, providers)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (rewritten path should succeed) body: %s", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("upstream hits = %d, want 2 (404 then 200 after rewrite)", got)
+	}
+	firstModel, _ := seenModels[0].Load().(string)
+	secondModel, _ := seenModels[1].Load().(string)
+	if firstModel != "meta-llama/llama-3.3-70b-instruct:free" {
+		t.Errorf("first attempt model = %q, want the original :free id", firstModel)
+	}
+	if secondModel != "openrouter/free" {
+		t.Errorf("second attempt model = %q, want %q", secondModel, "openrouter/free")
+	}
+}
+
+// 404 with a different error reason ("No endpoints found" rather than
+// "unavailable for free") must NOT trigger the rewrite: the client
+// should see the upstream 404 verbatim.
+func TestForwardOpenrouterNoRewriteForDifferentReason(t *testing.T) {
+	proxy.ResetRotationForTest()
+	var hits int32
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"type":"error","error":{"type":"not_found_error","message":"No endpoints found for foo/bar:free.","error_type":"not_found"}}`))
+	}))
+	defer upstreamSrv.Close()
+
+	providers := []proxy.Provider{{Name: "openrouter-1", Family: "openrouter", Key: "or-key"}}
+	us := proxy.Upstream{Type: "openrouter", BaseURL: upstreamSrv.URL, URLPattern: "/v1/messages"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+	proxy.ForwardOpenrouter(rec, req, []byte(`{"model":"foo/bar:free"}`), us, providers)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (no rewrite for non-free-promotion reason)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "No endpoints found") {
+		t.Errorf("body = %q, want it to keep the original upstream error", rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("upstream hits = %d, want 1 (no rewrite fired)", got)
+	}
+}
+
+// After the rewrite fires once, a second 404 with the same reason must
+// NOT loop forever. freeRewritten guards the loop; the second 404 must
+// fall through to the standard "not 2xx" classification so the client
+// gets the upstream message.
+func TestForwardOpenrouterFreeRewriteLoopGuard(t *testing.T) {
+	proxy.ResetRotationForTest()
+	var hits int32
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"type":"error","error":{"type":"not_found_error","message":"This model is unavailable for free"}}`))
+	}))
+	defer upstreamSrv.Close()
+
+	providers := []proxy.Provider{{Name: "openrouter-1", Family: "openrouter", Key: "or-key"}}
+	us := proxy.Upstream{Type: "openrouter", BaseURL: upstreamSrv.URL, URLPattern: "/v1/messages"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+	proxy.ForwardOpenrouter(rec, req, []byte(`{"model":"alpha/beta:free"}`), us, providers)
+	// Exactly two attempts: one with the original model, one with the
+	// rewritten "openrouter/free". A regression that lost the
+	// freeRewritten guard would push the count much higher.
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("upstream hits = %d, want 2 (rewrite fires once, then bails)", got)
+	}
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (last upstream 404 surfaced)", rec.Code)
+	}
+}
+
+// asString safely narrows an any to string for test assertions.
+func asString(v any) string {
+	s, _ := v.(string)
+	return s
 }
