@@ -89,12 +89,25 @@ func ForwardMinimax(w http.ResponseWriter, r *http.Request, body []byte, us Upst
 	httpClient, tr := upstreamClient(us.TimeoutS, proxyURLForFamily(us.Type))
 	defer tr.CloseIdleConnections()
 	upstreamURL := JoinTarget(us.BaseURL, us.URLPattern)
-	ptrs := make([]*Provider, len(providers))
+	// Filter to the minimax family ONLY. Other forwarders (opencode-go,
+	// opencode-zen, openrouter) do the same shape; without this filter
+	// buildAttemptOrder happily rotates through zen/go/or keys whose
+	// "Bearer <key>" and x-api-key are not valid for api.minimax.io, so
+	// every minimax-route request would have surfaced a 401
+	// "login fail" — exactly the symptom that prompted this fix.
+	var keys []*Provider
 	for i := range providers {
-		ptrs[i] = &providers[i]
+		if providers[i].Family == "minimax" {
+			keys = append(keys, &providers[i])
+		}
 	}
-	for i, p := range buildAttemptOrder("minimax", ptrs) {
-		log.Printf("minimax attempt %d/%d: provider=%s bytes=%d", i+1, len(providers), p.Name, len(body))
+	if len(keys) == 0 {
+		log.Printf("minimax: no MINIMAX_CODING_PLAN_KEY/MINIMAX_KEY providers configured")
+		http.Error(w, "minimax: no keys configured", http.StatusBadGateway)
+		return
+	}
+	for i, p := range buildAttemptOrder("minimax", keys) {
+		log.Printf("minimax attempt %d/%d: provider=%s bytes=%d", i+1, len(keys), p.Name, len(body))
 
 		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
 		req.Header.Set("Content-Type", r.Header.Get("Content-Type"))

@@ -90,6 +90,77 @@ func TestForwardMinimaxSendsCorrectPath(t *testing.T) {
 	}
 }
 
+
+// ForwardMinimax used to seed `buildAttemptOrder` with the entire
+// providers slice, so a rotation that landed on a Zen key would emit
+// `Bearer <zen-key>` and `x-api-key: <zen-key>` to api.minimax.io, which
+// immediately rejected both as 401 "login fail: Please carry the API
+// secret key in the 'X-Api-Key' field of the request header". The
+// observable contract: when three providers are passed and only the
+// two minimax-family ones are valid for MiniMax, only those two are
+// ever used as Authorization / x-api-key on outbound requests.
+func TestForwardMinimaxIgnoresNonMinimaxProviders(t *testing.T) {
+	proxy.ResetRotationForTest()
+	var hits int32
+	var seenAuth atomic.Value
+	var seenXAPIKey atomic.Value
+	seenAuth.Store("")
+	seenXAPIKey.Store("")
+	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		seenAuth.Store(r.Header.Get("Authorization"))
+		seenXAPIKey.Store(r.Header.Get("x-api-key"))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstreamSrv.Close()
+
+	providers := []proxy.Provider{
+		// These two SHOULD be used: they are the only minimax-family keys.
+		{Name: "minimax-coding-plan", Family: "minimax", Key: "minimax-good-key"},
+		{Name: "minimax", Family: "minimax", Key: "minimax-secondary-key"},
+		// These three MUST be ignored: they are wrong-family keys that the
+		// legacy code happily passed to buildAttemptOrder.
+		{Name: "opencode-zen-1", Family: "opencode-zen", Key: "zen-bogus"},
+		{Name: "opencode-go-1", Family: "opencode-go", Key: "go-bogus"},
+		{Name: "openrouter-1", Family: "openrouter", Key: "router-bogus"},
+	}
+	// Pre-poison rotation state so lastGood for "minimax" already points
+	// at one of the bogus providers. Without the family filter, the
+	// sticky-exhaustion logic in buildAttemptOrder would happily lead
+	// with that bogus key on every request.
+	// (markKeySuccess requires a Provider with the matching Family; we
+	// instead just rely on the first probe being whatever sits at index
+	// 0 after cooldown filters — which is whatever is not cooling.)
+	us := proxy.Upstream{Type: "minimax", BaseURL: upstreamSrv.URL, URLPattern: "/v1/messages"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{}`))
+	body := []byte(`{"model":"MiniMax-M3","messages":[{"role":"user","content":"ping"}]}`)
+	proxy.ForwardMinimax(rec, req, body, us, providers)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("upstream hits = %d, want 1 (no bogus retry expected)", got)
+	}
+	gotAuth, _ := seenAuth.Load().(string)
+	if !strings.HasPrefix(gotAuth, "Bearer minimax-") {
+		t.Errorf("Authorization = %q, want Bearer minimax-good-key or Bearer minimax-secondary-key; non-family keys would yield 'Bearer zen-bogus' / 'go-bogus' / 'router-bogus' and trigger MiniMax 401", gotAuth)
+	}
+	gotXAPI, _ := seenXAPIKey.Load().(string)
+	if !strings.HasPrefix(gotXAPI, "minimax-") {
+		t.Errorf("x-api-key = %q, want a minimax-family key (gotAuth=%q); the leaked zen/go/or keys make api.minimax.io reject the request outright", gotXAPI, gotAuth)
+	}
+
+	// Stats sanity: only the minimax-family providers touched the upstream.
+	for i, p := range providers {
+		if p.Family != "minimax" && p.Stats.Requests2xx+ p.Stats.Requests429+ p.Stats.FailoverHits != 0 {
+			t.Errorf("providers[%d] %s (Family=%s) got stats %+v; it must be untouched by ForwardMinimax", i, p.Name, p.Family, p.Stats)
+		}
+	}
+}
+
 func TestForwardMinimaxAllExhausted(t *testing.T) {
 	proxy.ResetRotationForTest()
 	upstreamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
