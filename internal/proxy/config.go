@@ -35,14 +35,19 @@ type Config struct {
 	ListenAddr string
 	DefaultUS  Upstream
 	Rules      []Rule
+	// ProxySpecs are upstream-routing proxies (e.g. local mihomo); main()
+	// calls LoadUpstreamProxy(...) once with this slice at startup.
+	ProxySpecs []UpstreamProxySpec
 }
 
 // --- default upstream (when no rule matches) ---
 
 const (
-	DefaultMinimaxURL  = "https://api.minimax.io/anthropic/v1/messages"
+	DefaultMinimaxURL  = "https://api.minimax.io/anthropic"
 	OpencodeGoBaseURL  = "https://opencode.ai/zen/go/v1"
 	opencodeZenBaseURL = "https://opencode.ai/zen/v1"
+	ollamaCloudBaseURL = "https://ollama.com/v1"
+	OpenrouterBaseURL  = "https://openrouter.ai/api/v1"
 	quotaRemainsURL    = "https://api.minimax.io/v1/token_plan/remains"
 	quotaRemainsCNURL  = "https://api.minimaxi.com/v1/token_plan/remains"
 	defaultListenAddr  = "127.0.0.1:8443"
@@ -155,6 +160,31 @@ func LoadRoutingConfigFromString(src string) (Config, error) {
 		}
 	}
 	log.Printf("llm-proxy: loaded %d routing rules", len(cfg.Rules))
+
+	if proxyRoot, ok := root["proxy"].(map[string]any); ok {
+		log.Printf("llm-proxy: proxy config section present, scanning routes[]")
+		if specsRaw, ok := proxyRoot["routes"].([]any); ok {
+			log.Printf("llm-proxy: found %d proxy routes in config", len(specsRaw))
+			for _, item := range specsRaw {
+				m, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				urlStr, _ := m["url"].(string)
+				if urlStr == "" {
+					continue
+				}
+				family, _ := m["family"].(string)
+				if family == "" {
+					continue
+				}
+				spec := UpstreamProxySpec{URL: urlStr, For: []string{family}}
+				cfg.ProxySpecs = append(cfg.ProxySpecs, spec)
+				log.Printf("llm-proxy: appended proxy route url=%q family=%q", spec.URL, family)
+			}
+		}
+	}
+
 	return cfg, nil
 }
 
@@ -211,7 +241,7 @@ func ParseToString(s string) (typ, mdl, base, url, eff string, ok bool) {
 		}
 	}
 	provider := ""
-	for _, c := range []string{"minimax", "opencode-go", "opencode-zen", "opencode"} {
+	for _, c := range []string{"minimax", "opencode-go", "opencode-zen", "opencode", "ollama", "openrouter"} {
 		if strings.HasPrefix(s, c+" ") || strings.HasPrefix(s, c+"/") {
 			provider = c
 			s = strings.TrimSpace(strings.TrimPrefix(s, c))
@@ -220,6 +250,15 @@ func ParseToString(s string) (typ, mdl, base, url, eff string, ok bool) {
 	}
 	if provider == "" {
 		return "", "", "", "", "", false
+	}
+	if provider == "ollama" {
+		// Ollama serves bare model names with a tag suffix, e.g.
+		// "deepseek-v4-flash:cloud". No namespace slash — the whole
+		// remainder is the model id.
+		if s == "" {
+			return "", "", "", "", "", false
+		}
+		return "ollama", s, "", "", effTok, true
 	}
 	idx := strings.Index(s, "/")
 	if idx < 0 {
@@ -260,6 +299,23 @@ func ParseToString(s string) (typ, mdl, base, url, eff string, ok bool) {
 		typ = "opencode-zen"
 		return typ, mod, "", "", effTok, true
 	}
+	if provider == "openrouter" {
+		// OpenRouter model ids are always "<vendor>/<name>" (e.g.
+		// "anthropic/claude-3.5-sonnet"); the slash is part of the id,
+		// not a routing label. Recombine namespace + mod exactly like
+		// the opencode-go branch below, but route to type=openrouter so
+		// buildUpstreamFromTo picks the right base URL and headers. A
+		// bare "openrouter *" target (no namespace) is also accepted —
+		// OpenRouter has no internal namespace concept, so a wildcard
+		// target is the canonical way to say "any model id".
+		if namespace == "" {
+			typ = "openrouter"
+			return typ, mod, "", "", effTok, true
+		}
+		mod = namespace + "/" + mod
+		typ = "openrouter"
+		return typ, mod, "", "", effTok, true
+	}
 	if namespace == "" {
 		typ = "opencode-go"
 		return typ, mod, "", "", effTok, true
@@ -285,6 +341,12 @@ func buildUpstreamFromTo(to, base, url, eff string, fallback Upstream) (Upstream
 	} else if typ == "opencode-zen" {
 		us.BaseURL = opencodeZenBaseURL
 		us.URLPattern = "/chat/completions"
+	} else if typ == "ollama" {
+		us.BaseURL = ollamaCloudBaseURL
+		us.URLPattern = "/chat/completions"
+	} else if typ == "openrouter" {
+		us.BaseURL = OpenrouterBaseURL
+		us.URLPattern = "/v1/messages"
 	} else {
 		us.BaseURL = OpencodeGoBaseURL
 		us.URLPattern = "/chat/completions"

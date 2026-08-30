@@ -11,17 +11,18 @@ import (
 
 // --- key rotation state ---
 //
-// Two problems with the naive "try every key in order on every request":
-//  1. A key that hit its usage limit is probed with a full upstream
-//     round-trip on EVERY request before the next key is tried — for large
-//     opencode bodies that is 1-3s of pure waste per request.
-//  2. Key 1 takes 100% of traffic until it dies, then everything funnels
-//     onto key 2 — individual weekly quotas exhaust one at a time.
+// Strategy: sticky exhaustion. Traffic stays on ONE key (the last one that
+// succeeded) until its limits are burned out, then moves to the next key with
+// quota left, burns it out too, and so on. Uniform round-robin is deliberately
+// NOT used: flipping keys on every request defeats upstream keep-alive/prompt
+// caching, which is bound to a single key session.
 //
-// Fix: per-family "last successful key" pointer (round-robin start) plus a
-// per-key cooldown deadline. A cooled key is skipped while it cools, probed
-// again once the deadline passes, and forgotten entirely on success — a key
-// is never permanently removed, only temporarily deprioritized.
+// A key that hits its usage limit (429) is put into cooldown for the whole
+// reset window (hours / week / month, parsed from the upstream "Resets in N"
+// hint) so it is not re-probed while exhausted. A cooled key is skipped while
+// it cools, probed again once the deadline passes (limits may reset), and
+// forgotten entirely on success — a key is never permanently removed, only
+// deprioritized behind the current burning key.
 
 var rotationState = struct {
 	mu       sync.Mutex
@@ -51,10 +52,13 @@ func setCooldown(p *Provider, status int, retryAfter string, body []byte) {
 	p.cooldownUntil.Store(deadline)
 }
 
-// buildAttemptOrder returns providers in try-order: the rotation (starting
-// after the last successful key) followed by keys still cooling down. If
-// every key is cooling down, all are returned as-is — cooldowns are hints,
-// not hard locks, and a stale cooldown must not brick the whole family.
+// buildAttemptOrder returns providers in try-order: the last successful key
+// FIRST (sticky — all traffic stays on it while it has quota), followed by
+// the other non-cooling keys, then the keys still cooling down. A key only
+// loses the lead when it is exhausted (429/limit), at which point the next
+// available key becomes the lead and is burned out too. If every key is
+// cooling down, all are returned as-is — cooldowns are hints, not hard
+// locks, and a stale cooldown must not brick the whole family.
 func buildAttemptOrder(family string, providers []*Provider) []*Provider {
 	rotationState.mu.Lock()
 	lastGood := rotationState.lastGood[family]
@@ -76,7 +80,7 @@ func buildAttemptOrder(family string, providers []*Provider) []*Provider {
 	idx := 0
 	for i, p := range good {
 		if p.Name == lastGood {
-			idx = i + 1
+			idx = i
 			break
 		}
 	}
@@ -87,19 +91,25 @@ func buildAttemptOrder(family string, providers []*Provider) []*Provider {
 }
 
 // --- cooldown durations ---
+//
+// Windows follow the upstream limit shapes: "several hours" (e.g. MiniMax
+// 5h), a week, a month. A 429 puts the key out of rotation until the whole
+// window resets, so an exhausted key is never re-probed while another key
+// still has quota. cooldownMax is only a safety cap against absurd hints.
 
 const (
-	cooldown429Default = 10 * time.Minute
+	cooldown429Default = 6 * time.Hour
 	cooldownAuth       = 30 * time.Minute
 	cooldownBadRequest = 30 * time.Second
 	cooldownTransport  = 5 * time.Second
-	cooldownMax        = 6 * time.Hour
+	cooldownMax        = 45 * 24 * time.Hour
 )
 
-// resetsInRe matches upstream limit messages like "Resets in 23hr 60min"
-// or "Resets in 1 day" so a key with a known reset time can cool for the
-// whole window instead of being re-probed every few minutes.
-var resetsInRe = regexp.MustCompile(`(?i)resets? in (\d+)\s*(hr|hour|min|minute|day|h|m|d)`)
+// resetsInRe matches upstream limit messages like "Resets in 23hr 60min",
+// "Resets in 1 day", "Resets in 2 weeks" or "Resets in 1 month" so a key
+// with a known reset time can cool for the whole window instead of being
+// re-probed while still exhausted.
+var resetsInRe = regexp.MustCompile(`(?i)resets? in (\d+)\s*(hr|hour|min|minute|day|week|month|h|m|d|w|mo)`)
 
 // cooldownFor picks how long a provider stays deprioritized after a failed
 // attempt. 429 honors Retry-After and the upstream "Resets in N" hint when
@@ -164,6 +174,10 @@ func parseResetsIn(body []byte) time.Duration {
 		return time.Duration(n) * time.Hour
 	case "d", "day":
 		return time.Duration(n) * 24 * time.Hour
+	case "w", "week":
+		return time.Duration(n) * 7 * 24 * time.Hour
+	case "mo", "month":
+		return time.Duration(n) * 31 * 24 * time.Hour
 	case "m", "min", "minute":
 		return time.Duration(n) * time.Minute
 	}

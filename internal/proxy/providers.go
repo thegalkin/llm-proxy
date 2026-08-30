@@ -87,13 +87,56 @@ func LoadProviders() ([]Provider, error) {
 		})
 	}
 
-	// opencode Zen (free tier) — single key, no failover. Optional: a
-	// missing key just hides the Zen family from routing.
+	// opencode Zen (free tier) — multi-key rotation. Keys read from
+	// OPENCODE_ZEN_KEY_1..N; a bare OPENCODE_ZEN_KEY (no suffix) is
+	// accepted as a single-key fallback for backward compatibility.
+	// A missing key just hides the Zen family from routing.
+	for i := 1; i <= 16; i++ {
+		k := os.Getenv(fmt.Sprintf("OPENCODE_ZEN_KEY_%d", i))
+		if k == "" {
+			continue
+		}
+		providers = append(providers, Provider{
+			Name:   fmt.Sprintf("opencode-zen-%d", i),
+			Family: "opencode-zen",
+			Key:    k,
+		})
+	}
 	if zk := os.Getenv("OPENCODE_ZEN_KEY"); zk != "" {
 		providers = append(providers, Provider{
 			Name:   "opencode-zen",
 			Family: "opencode-zen",
 			Key:    zk,
+		})
+	}
+
+	// Ollama Cloud — single key, no failover. Optional: a missing key
+	// just hides the Ollama family from routing.
+	if ok := os.Getenv("OLLAMA_API_KEY"); ok != "" {
+		providers = append(providers, Provider{
+			Name:   "ollama-cloud",
+			Family: "ollama",
+			Key:    ok,
+		})
+	}
+
+	// OpenRouter (openrouter.ai) — keys read from OPENROUTER_KEY_1..N.
+	// Blank entries are skipped; bare numeric suffix is appended to the
+	// alias. The upstream serves both an OpenAI-compatible
+	// (/api/v1/chat/completions) and an Anthropic-compatible
+	// (/api/v1/messages) endpoint; we hit the Anthropic one so the
+	// proxy stays drop-in for opencode's /v1/messages clients. OpenRouter
+	// accepts both Authorization: Bearer and x-api-key, so we set both
+	// (same belt-and-braces as ForwardMinimax).
+	for i := 1; i <= 16; i++ {
+		k := os.Getenv(fmt.Sprintf("OPENROUTER_KEY_%d", i))
+		if k == "" {
+			continue
+		}
+		providers = append(providers, Provider{
+			Name:   fmt.Sprintf("openrouter-%d", i),
+			Family: "openrouter",
+			Key:    k,
 		})
 	}
 
