@@ -48,9 +48,15 @@ const (
 	opencodeZenBaseURL = "https://opencode.ai/zen/v1"
 	ollamaCloudBaseURL = "https://ollama.com/v1"
 	OpenrouterBaseURL  = "https://openrouter.ai/api/v1"
-	quotaRemainsURL    = "https://api.minimax.io/v1/token_plan/remains"
-	quotaRemainsCNURL  = "https://api.minimaxi.com/v1/token_plan/remains"
 	defaultListenAddr  = "127.0.0.1:8443"
+)
+
+// quotaRemainsURL / quotaRemainsCNURL are package vars (not consts) so tests
+// can redirect fetchQuotaRemains at an httptest upstream. Production code
+// reads them exactly like consts — initialization happens at package load.
+var (
+	quotaRemainsURL   = "https://api.minimax.io/v1/token_plan/remains"
+	quotaRemainsCNURL = "https://api.minimaxi.com/v1/token_plan/remains"
 )
 
 // resolveConfigPath picks the routing-config path. LLM_PROXY_CONFIG
