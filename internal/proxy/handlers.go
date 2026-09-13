@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"llm-proxy/internal/proxy/synthetic"
 )
 
 // registerRoutes wires all HTTP endpoints onto mux.
@@ -134,6 +136,39 @@ func HandleModels(cfg *Config) http.HandlerFunc {
 			"llm-proxy/GO/deepseek-v4-flash",
 			"llm-proxy/GO/minimax-m3",
 		} {
+			add(id)
+		}
+		// OpenRouter free-tier models — fetched at startup and refreshed every
+		// OPENROUTER_CATALOG_TTL (see openrouter_catalog.go). OpenRouter.ai
+		// rejects the API key on direct connections ("Access denied by security
+		// policy") so the fetch MUST go via the family's configured upstream
+		// proxy (typically the local clash on 127.0.0.1:7897).
+		snapshotOpenRouterIDs(func(ids []string) {
+			for _, m := range ids {
+				add("llm-proxy/openrouter/" + m)
+			}
+		})
+		// OpenRouter auto-router model IDs (NOT user-facing free IDs —
+		// these are OR's meta-models that internally select the best
+		// priced/coding model per request). Surfaces them as
+		// `llm-proxy/openrouter/<id>` so omp can
+		// `--model llm-proxy/openrouter/openrouter/auto`. routing.go
+		// strips the `openrouter/` prefix on the body model field
+		// before forwarding to https://openrouter.ai/api/v1/chat/completions.
+		for _, id := range []string{
+			"openrouter/auto",
+			"openrouter/auto-beta",
+			"openrouter/pareto-code",
+			"openrouter/fusion",
+			"openrouter/free",
+			"openrouter/bodybuilder",
+		} {
+			add("llm-proxy/openrouter/" + id)
+		}
+		// Synthetic role-routed model IDs (one per omp role). Selection is
+		// performed by ForwardSynthetic via the per-role ladder in the
+		// synthetic/ package — omp just sees a single, stable ID per role.
+		for _, id := range synthetic.CatalogIDs() {
 			add(id)
 		}
 		w.Header().Set("Content-Type", "application/json")
