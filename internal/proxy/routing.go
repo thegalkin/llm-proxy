@@ -38,6 +38,20 @@ func Decide(cfg *Config, body []byte, requestPath string, hostProvider string) R
 		key = requestPath
 	}
 
+	// Synthetic model IDs (`synthetic/<role>` or `llm-proxy/synthetic/<role>`)
+	// bypass ResolveRule — instead the dispatched ForwardSynthetic walks the
+	// per-role ladder. The role name is captured in RuleName so the handler
+	// log can show what role was attempted.
+	if (strings.HasPrefix(key, "synthetic/") || strings.HasPrefix(key, "llm-proxy/synthetic/")) &&
+		strings.Contains(model, "/") {
+		rd := RoutingDecision{
+			Upstream:      Upstream{Type: "synthetic", Model: model},
+			RewrittenBody: body,
+			RuleName:      model,
+		}
+		return rd
+	}
+
 	us := cfg.ResolveRule(key)
 	rd := RoutingDecision{Upstream: us, RuleName: key}
 
@@ -51,6 +65,16 @@ func Decide(cfg *Config, body []byte, requestPath string, hostProvider string) R
 			us.URLPattern = "/v1/messages"
 			rd.Upstream = us
 		}
+	}
+	// Openrouter.ai serves BOTH Anthropic-shape (/v1/messages) and
+	// OpenAI-shape (/chat/completions). The proxy default is Anthropic
+	// (see buildUpstreamFromTo -> "openrouter" branch), but omp clients
+	// post to /v1/chat/completions with an OpenAI body — flipping the
+	// upstream URL to /chat/completions lets those requests go through
+	// without rewriting the body shape.
+	if us.Type == "openrouter" && strings.HasSuffix(requestPath, "/chat/completions") {
+		us.URLPattern = "/chat/completions"
+		rd.Upstream = us
 	}
 
 	if us.Model != "" && model != "" && us.Model != model {

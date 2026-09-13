@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -41,6 +42,14 @@ func main() {
 	if err := proxy.LoadUpstreamProxy(os.Getenv("LLM_PROXY_HTTP_PROXY"), cfg.ProxySpecs); err != nil {
 		log.Fatalf("llm-proxy: %v", err)
 	}
+
+	// Background goroutine: fetch openrouter free-models every 10 minutes
+	// so /v1/models always reflects the live catalog without manual
+	// edits. Cancel via the ctx passed to ListenAndServe below; in this
+	// minimal main() the goroutine runs for the lifetime of the process.
+	refreshCtx, refreshCancel := context.WithCancel(context.Background())
+	defer refreshCancel()
+	proxy.StartOpenRouterCatalogRefresher(refreshCtx)
 
 	mux := http.NewServeMux()
 	proxy.RegisterRoutes(mux, &cfg, providers)

@@ -79,6 +79,8 @@ func forward(cfg *Config, w http.ResponseWriter, r *http.Request, body []byte, d
 		ForwardOpenrouter(w, r, body, us, providers)
 	case "passthrough":
 		ForwardPassthrough(w, r, body, us)
+	case "synthetic":
+		ForwardSynthetic(w, r, body, decision.RuleName, providers)
 	default:
 		log.Printf("llm-proxy: unknown upstream type %q", us.Type)
 		http.Error(w, "no upstream configured", http.StatusBadGateway)
@@ -297,6 +299,11 @@ func ForwardOpencodeGo(w http.ResponseWriter, r *http.Request, body []byte, us U
 		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+p.Key)
+		// OpenCode Go requires a stable per-conversation session id for
+		// routing / prompt-cache; forward the client's when present.
+		if sid := r.Header.Get("x-opencode-session"); sid != "" {
+			req.Header.Set("x-opencode-session", sid)
+		}
 		if strings.HasSuffix(target, "/messages") {
 			req.Header.Set("x-api-key", p.Key)
 			req.Header.Set("anthropic-version", "2023-06-01")
