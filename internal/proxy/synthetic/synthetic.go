@@ -134,12 +134,12 @@ func ladderDefault() []Target {
 // must not be encoded here. The trailing go entry is what keeps the role
 // from hard-failing while the paid path is healthy.
 //
-// The openrouter/pareto-code row is not a dependable terminal: OpenRouter
-// 402s it whenever the account balance cannot cover the request's
-// max_tokens ("You requested up to 8000 tokens, but can only afford 662"),
-// which is every real agent request. Reproduced directly against OR on
-// 2026-09-15, and not proxy-side — the proxy never emits 402, it copies the
-// upstream status. That is why the go entry, not the router, is last.
+// No openrouter/pareto-code row: it is a PAID OR router, this account has no
+// OR credit and will not get any, and OR 402s it on any request whose
+// max_tokens exceeds the balance ("You requested up to 8000 tokens, but can
+// only afford 662") — i.e. every real agent request. A row that can never
+// serve is a wasted round-trip, not a fallback. Paid fallback here means the
+// funded go subscription, which is what the last row is.
 func ladderSmol() []Target {
 	return []Target{
 		{FamOpenrouter, "nvidia/nemotron-3.5-lightning:free", "free-fast"},
@@ -147,7 +147,6 @@ func ladderSmol() []Target {
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
 		{FamOpenrouter, "liquid/lfm-2.5-2.6b:free", "free-tiny"},
 		{FamOpenrouter, "dots-studio/dots-3-note-preview:free", "free-note"},
-		{FamOpenrouter, "openrouter/pareto-code", "free-router"},
 		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-terminal"},
 	}
 }
