@@ -159,8 +159,12 @@ func TestMinimaxPaidAnchor(t *testing.T) {
 // 401/403/429/400 as key failures (forward.go:818), 403 cools the key for 30
 // minutes (rotation.go:102 cooldownAuth), and with a single openrouter key
 // the family then answers 429 "all openrouter keys exhausted" (forward.go:877).
-// So that 429 is the aggregate of the slug's own 403, not quota — and probing
-// a gated row costs the only free-tier key a 30-minute cooldown.
+// So that 429 is the aggregate of the slug's own 403, not quota. The cooldown
+// it records is only a hint at this scale: when every key of a family is
+// cooling, buildAttemptOrder returns them as-is (rotation.go:56) instead of
+// bricking the family, so the single openrouter key keeps being tried and the
+// real cost of probing a gated row is one failed round-trip. A second OR key
+// is what would turn that hint into a 30-minute sideline.
 //
 // 429 rows are deliberately NOT listed — they recover. nemotron free and
 // laguna both take heavy 429s and still deliver, and the position confound
