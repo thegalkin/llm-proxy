@@ -14,14 +14,16 @@ func TestAllRolesCovered(t *testing.T) {
 			if len(ladder) == 0 {
 				t.Fatalf("role %q returned empty ladder", role)
 			}
-			// Last entry must be a terminal router — except for a role
-			// that deliberately ends on the funded paid primary (smol,
-			// whose free tier is not trusted to be the last word).
+			// Last entry must be a terminal router. smol is the one
+			// exempt role: it is free-first and ends on the funded paid
+			// primary instead, so that its free tier never has the last
+			// word. TestSmolKeepsPaidTerminal pins that row.
+			if role == RoleSmol {
+				return
+			}
 			last := ladder[len(ladder)-1]
-			terminalRouter := strings.HasPrefix(last.Model, "openrouter/")
-			paidTerminal := last.Family == FamOpencodeGo && last.Model == "deepseek-v4.1-flash"
-			if !terminalRouter && !paidTerminal {
-				t.Errorf("role %q terminal %q is neither an openrouter router nor the paid primary",
+			if !strings.HasPrefix(last.Model, "openrouter/") {
+				t.Errorf("role %q terminal %q is not an openrouter router",
 					role, formatTarget(last))
 			}
 		})
