@@ -145,13 +145,22 @@ func TestMinimaxPaidAnchor(t *testing.T) {
 //     "Model hy3-free is not supported", "Model minimax/x-preview-f-free is
 //     not supported" (401, 237 each), and nemotron-3.5-lightning-free on the
 //     same family (428x400 / 1050x403 / 586x429). Zero deliveries ever.
-//   - gated by policy: thinkingmachines/inkling:free IS in the catalog and
-//     still cannot deliver — 2389 attempts, 2380x403, zero deliveries, with
-//     the body spelling it out: "only available on agentic harnesses. Try
-//     plugging it into a coding agent or productivity app", failed routing
-//     step "Gate Free Endpoints by Agentic Harness". Catalog presence alone
-//     never decides this class; the gate would lift only if the proxy ever
-//     presented itself as a listed app.
+//   - gated by app identity: thinkingmachines/inkling:free IS in the catalog
+//     and still cannot deliver — 2389 attempts, 2380x403, zero deliveries,
+//     with the body spelling out why: "only available on agentic harnesses.
+//     Try plugging it into a coding agent or productivity app", failed
+//     routing step "Gate Free Endpoints by Agentic Harness". The harness
+//     identity OR sees is our own attribution, X-Title: llm-proxy
+//     (forward.go:731) — not a listed app, so the endpoint stays gated. A
+//     listed app name there could unlock this whole class; that is a claim of
+//     app identity, so it stays a user decision and nothing here sends it.
+//
+// An upstream 403 on a gated slug does not surface as 403. The family treats
+// 401/403/429/400 as key failures (forward.go:818), 403 cools the key for 30
+// minutes (rotation.go:102 cooldownAuth), and with a single openrouter key
+// the family then answers 429 "all openrouter keys exhausted" (forward.go:877).
+// So that 429 is the aggregate of the slug's own 403, not quota — and probing
+// a gated row costs the only free-tier key a 30-minute cooldown.
 //
 // 429 rows are deliberately NOT listed — they recover. nemotron free and
 // laguna both take heavy 429s and still deliver, and the position confound
@@ -183,7 +192,7 @@ func TestNoDeadFreeIDs(t *testing.T) {
 	for _, role := range AllRoles {
 		for i, entry := range Cached(role) {
 			if dead[entry.Model] {
-				t.Errorf("role %q step %d uses retired free id %s", role, i+1, formatTarget(entry))
+				t.Errorf("role %q step %d uses unservable free id %s", role, i+1, formatTarget(entry))
 			}
 		}
 	}
