@@ -134,28 +134,39 @@ func TestMinimaxPaidAnchor(t *testing.T) {
 }
 
 // TestNoDeadFreeIDs — free IDs that cannot serve must not appear in any
-// ladder. Two distinct classes are pinned here, because only one of them is
+// ladder. Two distinct classes are pinned here, and only one of them is
 // visible in OpenRouter's catalog (GET /v1/models, snapshot at startup):
 //
 //   - retired: absent from the catalog. minimax/minimax-m2.7:free,
 //     minimax/minimax-m3:free and z-ai/glm-5.2:free — OR answers 404
 //     "unavailable for free", the ladder advances, and the row is a pure
 //     wasted round-trip. `default` was paying six of them per request.
-//   - present but never served: thinkingmachines/inkling:free is still in
-//     the catalog yet 403s and has zero deliveries ever; the zen rows
-//     (nemotron-3.5-lightning-free, hy3-free, x-preview-f-free) likewise
-//     403 on every attempt. Retired-or-broken is the same thing from the
-//     ladder's point of view: a row that cannot deliver.
+//   - listed but cannot serve: thinkingmachines/inkling:free is in the
+//     catalog yet the 30-day journal shows 2389 attempts, 2380 of them 403
+//     and zero deliveries ever. The zen rows fail the same way —
+//     nemotron-3.5-lightning-free 2068 attempts / 0 deliveries (403/400/
+//     429), hy3-free and x-preview-f-free 401, zero deliveries. A live probe
+//     cannot always settle this class: probing inkling on 2026-09-15 just
+//     returned "all openrouter keys exhausted" (429), because the whole free
+//     tier rides one key. Journal history is the stronger authority here.
 //
 // poolside/laguna-s-2.1:free deliberately is NOT listed despite 2983
-// historical 404s: it is a flapping free pool, not a retired slug — probed
-// live 2026-09-15 it returned 200 serving itself. It sits at the tail of
-// ladderSmol() where a flap costs one fast advance and nothing else.
+// historical 404s: it is a flapping free pool, not a retired slug — 1952
+// deliveries in the same 30-day journal, plus a live 200 serving itself on
+// 2026-09-15. It sits at the tail of ladderSmol() where a flap costs one
+// fast advance and nothing else.
+//
+// Beware the position confound when reading per-row delivery rates: a row
+// is only attempted after the rows above it failed, and on this proxy those
+// failures are mostly key-level 429s (one openrouter key serves every free
+// row). Rows low in a ladder therefore look worse than they are, which is
+// exactly why the dead list is a small curated set rather than a threshold.
 //
 // Raw (non-synthetic) requests for a retired slug are rescued upstream of
 // this: forward.go rewrites the model to openrouter/free and retries on the
-// same key, so a bare 200 there can carry a substituted model in the body.
-// The ladder path does not rewrite — it logs "status=404, advancing".
+// same key, so a bare 200 there proves nothing unless the body's model
+// equals the requested id. The ladder path does not rewrite — it logs
+// "status=404, advancing".
 func TestNoDeadFreeIDs(t *testing.T) {
 	dead := map[string]bool{
 		"minimax/minimax-m2.7:free":     true,
