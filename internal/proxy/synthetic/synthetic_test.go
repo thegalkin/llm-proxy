@@ -15,13 +15,19 @@ func TestAllRolesCovered(t *testing.T) {
 				t.Fatalf("role %q returned empty ladder", role)
 			}
 			// Last entry must be a terminal router. smol is the one
-			// exempt role: it is free-first and ends on the funded paid
-			// primary instead, so that its free tier never has the last
-			// word. TestSmolKeepsPaidTerminal pins that row.
+			// exempt role: it is free-first, so its LAST row must be the
+			// funded paid primary instead — a free tier must not have the
+			// last word, or a drained pool hard-fails the role. Asserted
+			// positionally: "a go row exists somewhere" would stay green
+			// if someone appended a row after it.
+			last := ladder[len(ladder)-1]
 			if role == RoleSmol {
+				if last.Family != FamOpencodeGo || last.Model != "deepseek-v4.1-flash" {
+					t.Errorf("role %q terminal = %s, want opencode-go:deepseek-v4.1-flash",
+						role, formatTarget(last))
+				}
 				return
 			}
-			last := ladder[len(ladder)-1]
 			if !strings.HasPrefix(last.Model, "openrouter/") {
 				t.Errorf("role %q terminal %q is not an openrouter router",
 					role, formatTarget(last))
@@ -50,8 +56,8 @@ func TestNoZenRows(t *testing.T) {
 // TestOpencodeGoPrimaryExceptSmol — opencode-go is the funded paid-primary
 // family: every ladder except smol must lead with the deepseek primary and
 // the glm fallback. smol is exempt by design (the user made it free-first);
-// what smol must keep instead is a reachable paid fallback, which
-// TestSmolKeepsPaidTerminal asserts.
+// the paid row it must keep instead is asserted as its terminal in
+// TestAllRolesCovered.
 func TestOpencodeGoPrimaryExceptSmol(t *testing.T) {
 	for _, role := range AllRoles {
 		if role == RoleSmol {
@@ -68,19 +74,6 @@ func TestOpencodeGoPrimaryExceptSmol(t *testing.T) {
 			t.Errorf("role %q fallback = %s, want opencode-go:glm-5.3-flash", role, formatTarget(got))
 		}
 	}
-}
-
-// TestSmolKeepsPaidTerminal — smol leads with free models, but the funded
-// paid primary must still be reachable in its ladder. Without it, a drained
-// free pool (the historical failure mode: 5 hard failures in one day) takes
-// the role down instead of degrading to paid.
-func TestSmolKeepsPaidTerminal(t *testing.T) {
-	for _, entry := range Cached(RoleSmol) {
-		if entry.Family == FamOpencodeGo {
-			return
-		}
-	}
-	t.Errorf("role %q has no opencode-go row; a drained free tier would hard-fail it", RoleSmol)
 }
 
 // TestNoDuplicateRows — a ladder must never list the same (family, model)
