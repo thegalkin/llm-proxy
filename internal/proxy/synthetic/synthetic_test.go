@@ -134,38 +134,41 @@ func TestMinimaxPaidAnchor(t *testing.T) {
 }
 
 // TestNoDeadFreeIDs — free IDs that cannot serve must not appear in any
-// ladder. Two distinct classes are pinned here, and only one of them is
-// visible in OpenRouter's catalog (GET /v1/models, snapshot at startup):
+// ladder. The 30-day journal puts them in three classes, and only the first
+// is visible in OpenRouter's catalog (GET /v1/models, snapshot at startup):
 //
 //   - retired: absent from the catalog. minimax/minimax-m2.7:free,
-//     minimax/minimax-m3:free and z-ai/glm-5.2:free — OR answers 404
+//     minimax/minimax-m3:free and z-ai/glm-5.2:free — upstream 404s
 //     "unavailable for free", the ladder advances, and the row is a pure
 //     wasted round-trip. `default` was paying six of them per request.
-//   - listed but cannot serve: thinkingmachines/inkling:free is in the
-//     catalog yet the 30-day journal shows 2389 attempts, 2380 of them 403
-//     and zero deliveries ever. The zen rows fail the same way —
-//     nemotron-3.5-lightning-free 2068 attempts / 0 deliveries (403/400/
-//     429), hy3-free and x-preview-f-free 401, zero deliveries. A live probe
-//     cannot always settle this class: probing inkling on 2026-09-15 just
-//     returned "all openrouter keys exhausted" (429), because the whole free
-//     tier rides one key. Journal history is the stronger authority here.
+//   - unsupported slug: the upstream rejects the id outright —
+//     "Model hy3-free is not supported", "Model minimax/x-preview-f-free is
+//     not supported" (401, 237 each), and nemotron-3.5-lightning-free on the
+//     same family (428x400 / 1050x403 / 586x429). Zero deliveries ever.
+//   - gated by policy: thinkingmachines/inkling:free IS in the catalog and
+//     still cannot deliver — 2389 attempts, 2380x403, zero deliveries, with
+//     the body spelling it out: "only available on agentic harnesses. Try
+//     plugging it into a coding agent or productivity app", failed routing
+//     step "Gate Free Endpoints by Agentic Harness". Catalog presence alone
+//     never decides this class; the gate would lift only if the proxy ever
+//     presented itself as a listed app.
 //
-// poolside/laguna-s-2.1:free deliberately is NOT listed despite 2983
-// historical 404s: it is a flapping free pool, not a retired slug — 1952
-// deliveries in the same 30-day journal, plus a live 200 serving itself on
-// 2026-09-15. It sits at the tail of ladderSmol() where a flap costs one
-// fast advance and nothing else.
+// 429 rows are deliberately NOT listed — they recover. nemotron free and
+// laguna both take heavy 429s and still deliver, and the position confound
+// makes low rows look worse than they are: a row is only attempted after the
+// rows above it failed, and those failures are mostly key-level 429s from the
+// single openrouter key that serves the whole free tier. Hence a small
+// curated list, not a delivery-rate threshold.
 //
-// Beware the position confound when reading per-row delivery rates: a row
-// is only attempted after the rows above it failed, and on this proxy those
-// failures are mostly key-level 429s (one openrouter key serves every free
-// row). Rows low in a ladder therefore look worse than they are, which is
-// exactly why the dead list is a small curated set rather than a threshold.
+// poolside/laguna-s-2.1:free is the cautionary case: 2983x404 in the journal
+// yet 1952 deliveries and a live 200 serving itself on 2026-09-15, so it is a
+// flapping pool, not a retired slug — it sits at the tail of ladderSmol()
+// where a flap costs one fast advance and nothing else.
 //
 // Raw (non-synthetic) requests for a retired slug are rescued upstream of
 // this: forward.go rewrites the model to openrouter/free and retries on the
-// same key, so a bare 200 there proves nothing unless the body's model
-// equals the requested id. The ladder path does not rewrite — it logs
+// same key, so a bare 200 there proves nothing unless the body's model equals
+// the requested id. The ladder path does not rewrite — it logs
 // "status=404, advancing".
 func TestNoDeadFreeIDs(t *testing.T) {
 	dead := map[string]bool{
