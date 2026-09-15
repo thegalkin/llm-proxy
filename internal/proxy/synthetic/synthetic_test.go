@@ -14,34 +14,47 @@ func TestAllRolesCovered(t *testing.T) {
 			if len(ladder) == 0 {
 				t.Fatalf("role %q returned empty ladder", role)
 			}
-			// Last entry must be a router (terminal fallback).
+			// Last entry must be a terminal router — except for a role
+			// that deliberately ends on the funded paid primary (smol,
+			// whose free tier is not trusted to be the last word).
 			last := ladder[len(ladder)-1]
-			if !strings.HasPrefix(last.Model, "openrouter/") {
-				t.Errorf("role %q terminal %q is not an openrouter router",
+			terminalRouter := strings.HasPrefix(last.Model, "openrouter/")
+			paidTerminal := last.Family == FamOpencodeGo && last.Model == "deepseek-v4.1-flash"
+			if !terminalRouter && !paidTerminal {
+				t.Errorf("role %q terminal %q is neither an openrouter router nor the paid primary",
 					role, formatTarget(last))
 			}
 		})
 	}
 }
 
-// TestNoPaidZen — paid-zen rows must NEVER appear in any ladder.
-// The user's funded set is: minimax (paid), openrouter (paid+free),
-// zen (free-only). Anything matching zen but not "-free" should be
-// absent.
-func TestNoPaidZen(t *testing.T) {
+// TestNoZenRows — no ladder may reference the opencode-zen family at all.
+// The zen free tier is 403-gated server-side ("OpenCode's free tier can
+// only be used in OpenCode"), and its keys are byte-identical to the
+// opencode-go keys, so a zen row is dead weight plus a guaranteed wasted
+// round-trip. This replaces the older TestNoPaidZen, which only banned
+// paid zen rows.
+func TestNoZenRows(t *testing.T) {
 	for _, role := range AllRoles {
 		for i, entry := range Cached(role) {
-			if entry.Family == FamOpencodeZen && !isFree(entry.Model) {
-				t.Errorf("role %q step %d is paid-zen: %s", role, i+1, formatTarget(entry))
+			if entry.Family == FamOpencodeZen {
+				t.Errorf("role %q step %d is a zen row (%s); zen cannot serve",
+					role, i+1, formatTarget(entry))
 			}
 		}
 	}
 }
 
-// TestOpencodeGoPrimary — opencode-go is the funded paid-primary family:
-// every ladder must lead with the deepseek primary and the glm fallback.
-func TestOpencodeGoPrimary(t *testing.T) {
+// TestOpencodeGoPrimaryExceptSmol — opencode-go is the funded paid-primary
+// family: every ladder except smol must lead with the deepseek primary and
+// the glm fallback. smol is exempt by design (the user made it free-first);
+// what smol must keep instead is a reachable paid fallback, which
+// TestSmolKeepsPaidTerminal asserts.
+func TestOpencodeGoPrimaryExceptSmol(t *testing.T) {
 	for _, role := range AllRoles {
+		if role == RoleSmol {
+			continue
+		}
 		ladder := Cached(role)
 		if len(ladder) < 2 {
 			t.Fatalf("role %q ladder has %d entries, want >=2", role, len(ladder))
@@ -54,36 +67,35 @@ func TestOpencodeGoPrimary(t *testing.T) {
 		}
 	}
 }
-// TestProviderPairing — when a free ID exists on both `openrouter`
-// and `opencode-zen`, the ladder MUST list at least one of each at
-// adjacent slots so a single-provider outage doesn't kill the role.
-// Note: nemotron-3-ultra was removed from ladderSlow() because of
-// poor model quality (per user feedback); it stays out of the
-// pairing list and survives elsewhere only via the openrouter
-// catalog — never as a synthetic ladder entry.
-func TestProviderPairing(t *testing.T) {
-	pairs := []struct{ orID, zenID string }{
-		{"nvidia/nemotron-3.5-lightning:free", "nemotron-3.5-lightning-free"},
-		{"poolside/laguna-s-2.1:free", "laguna-s-2.1-free"},
+
+// TestSmolKeepsPaidTerminal — smol leads with free models, but the funded
+// paid primary must still be reachable in its ladder. Without it, a drained
+// free pool (the historical failure mode: 5 hard failures in one day) takes
+// the role down instead of degrading to paid.
+func TestSmolKeepsPaidTerminal(t *testing.T) {
+	for _, entry := range Cached(RoleSmol) {
+		if entry.Family == FamOpencodeGo {
+			return
+		}
 	}
+	t.Errorf("role %q has no opencode-go row; a drained free tier would hard-fail it", RoleSmol)
+}
+
+// TestNoDuplicateRows — a ladder must never list the same (family, model)
+// twice: the duplicate is a guaranteed wasted round-trip on the hot path,
+// and it means the ladder was edited without checking what was already
+// there. This replaces the old openrouter/zen pairing test, whose premise
+// (zen as a redundant second provider) was false — the zen keys are the
+// same credentials as the go keys, so zen contributed no capacity.
+func TestNoDuplicateRows(t *testing.T) {
 	for _, role := range AllRoles {
-		ladder := Cached(role)
-		for _, p := range pairs {
-			orIdx := indexOf(ladder, p.orID)
-			zenIdx := indexOf(ladder, p.zenID)
-			if orIdx >= 0 && zenIdx >= 0 {
-				// Both present — good. No adjacency requirement: the
-				// paired entry's purpose is to provide a redundant
-				// path if one provider family exhausts.
-				continue
+		seen := map[string]int{}
+		for i, entry := range Cached(role) {
+			key := formatTarget(entry)
+			if prev, dup := seen[key]; dup {
+				t.Errorf("role %q lists %s twice (steps %d and %d)", role, key, prev+1, i+1)
 			}
-			if orIdx >= 0 || zenIdx >= 0 {
-				// Exactly one present — pair is incomplete. Only
-				// acceptable when the role doesn't need the model at
-				// all.
-				continue
-			}
-			_ = role
+			seen[key] = i
 		}
 	}
 }
@@ -106,12 +118,12 @@ func TestFamilyVariety(t *testing.T) {
 	}
 }
 
-// TestMinimaxPaidAnchor — roles that called for paid anchoring
-// (default, smol, slow, plan, task) must include at least one
-// `FamMinimax` row before the terminal router, so paid quality is
-// reachable within the budget window.
+// TestMinimaxPaidAnchor — roles that called for a paid minimax anchor
+// (default, plan, task) must include at least one `FamMinimax` row before
+// the terminal router. smol is no longer in this list: it is free-first by
+// user decision, and its paid anchor is opencode-go.
 func TestMinimaxPaidAnchor(t *testing.T) {
-	needs := []string{RoleDefault, RoleSmol, RolePlan, RoleTask}
+	needs := []string{RoleDefault, RolePlan, RoleTask}
 	for _, role := range needs {
 		found := false
 		for _, entry := range Cached(role) {
@@ -122,6 +134,32 @@ func TestMinimaxPaidAnchor(t *testing.T) {
 		}
 		if !found {
 			t.Errorf("role %q has no minimax-paid anchor", role)
+		}
+	}
+}
+
+// TestNoDeadFreeIDs — free IDs retired upstream must not reappear in any
+// ladder. Each one below was confirmed dead on 2026-09-15 (OpenRouter 404
+// for the minimax/poolside/z-ai/inkling slugs; 403 with zero deliveries ever
+// for the zen free rows). A ladder row pointing at a dead ID is a
+// guaranteed wasted round-trip on the hot path — `default` was paying six
+// of them per request.
+func TestNoDeadFreeIDs(t *testing.T) {
+	dead := map[string]bool{
+		"minimax/minimax-m2.7:free":     true,
+		"minimax/minimax-m3:free":       true,
+		"poolside/laguna-s-2.1:free":    true,
+		"z-ai/glm-5.2:free":             true,
+		"thinkingmachines/inkling:free": true,
+		"nemotron-3.5-lightning-free":   true,
+		"hy3-free":                      true,
+		"x-preview-f-free":              true,
+	}
+	for _, role := range AllRoles {
+		for i, entry := range Cached(role) {
+			if dead[entry.Model] {
+				t.Errorf("role %q step %d uses retired free id %s", role, i+1, formatTarget(entry))
+			}
 		}
 	}
 }
@@ -190,24 +228,7 @@ func TestResolveUnknownRole(t *testing.T) {
 
 // --- helpers ---
 
-// isFree heuristically identifies free-tier model IDs:
-//   - openrouter IDs end with `:free`
-//   - opencode-zen IDs end with `-free` (e.g. `muse-spark-1.2-contributor-free`)
-//   - minimax family has no free IDs in this configuration.
-func isFree(model string) bool {
-	return strings.HasSuffix(model, ":free") || strings.HasSuffix(model, "-free")
-}
-
 // formatTarget renders a Target for stable error messages.
 func formatTarget(t Target) string {
 	return t.Family + ":" + t.Model
-}
-
-func indexOf(ladder []Target, model string) int {
-	for i, e := range ladder {
-		if e.Model == model {
-			return i
-		}
-	}
-	return -1
 }
