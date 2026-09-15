@@ -134,16 +134,20 @@ func TestMinimaxPaidAnchor(t *testing.T) {
 }
 
 // TestNoDeadFreeIDs — free IDs retired upstream must not reappear in any
-// ladder. Each one below was confirmed dead on 2026-09-15 (OpenRouter 404
-// for the minimax/poolside/z-ai/inkling slugs; 403 with zero deliveries ever
-// for the zen free rows). A ladder row pointing at a dead ID is a
-// guaranteed wasted round-trip on the hot path — `default` was paying six
-// of them per request.
+// ladder. The minimax pair, z-ai/glm-5.2 and thinkingmachines/inkling were
+// confirmed dead on 2026-09-15 (OpenRouter 404 "unavailable for free");
+// the zen rows 403 and have zero deliveries ever. A ladder row pointing at
+// a retired ID is a guaranteed wasted round-trip on the hot path — `default`
+// was paying six of them per request.
+//
+// poolside/laguna-s-2.1:free deliberately is NOT in this list despite 2983
+// historical 404s: it is a flapping free pool, not a retired slug — probed
+// live 2026-09-15 it returned 200 serving itself. It sits at the tail of
+// ladderSmol() where a flap costs one fast advance and nothing else.
 func TestNoDeadFreeIDs(t *testing.T) {
 	dead := map[string]bool{
 		"minimax/minimax-m2.7:free":     true,
 		"minimax/minimax-m3:free":       true,
-		"poolside/laguna-s-2.1:free":    true,
 		"z-ai/glm-5.2:free":             true,
 		"thinkingmachines/inkling:free": true,
 		"nemotron-3.5-lightning-free":   true,
