@@ -147,6 +147,7 @@ func ladderSmol() []Target {
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
 		{FamOpenrouter, "liquid/lfm-2.5-2.6b:free", "free-tiny"},
 		{FamOpenrouter, "dots-studio/dots-3-note-preview:free", "free-note"},
+		{FamOpenrouter, "poolside/laguna-s-2.1:free", "free-swe-tail"},
 		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-terminal"},
 	}
 }
