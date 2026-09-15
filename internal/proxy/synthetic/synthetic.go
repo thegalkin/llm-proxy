@@ -59,8 +59,8 @@ var AllRoles = []string{
 }
 
 // Target is one ladder step: route (family, model-id) where model-id is
-// the upstream wire-format name (e.g. "nex-agi/nex-n2.5-pro:free" for
-// openrouter, "deepseek-v4.1-flash" for opencode-go).
+// the upstream wire-format name (e.g. "<vendor>/<model>:free" for
+// openrouter, "<model>" bare for opencode-go).
 type Target struct {
 	Family string // matches proxy Upstream.Type
 	Model  string // wire-format model id; OR uses "<vendor>/<name>[:free]", go uses bare names
