@@ -2,8 +2,12 @@
 // llm-proxy. Instead of binding omp to a single model per role, the
 // proxy exposes 10 synthetic model IDs (`synthetic/<role>`) and runs
 // a per-role ordered ladder of upstream attempts whenever one is
-// requested. The first 2xx response is streamed to the caller; any
-// transient failure (400/401/403/404/429) advances to the next entry.
+// requested. Every ladder is free-first and opens with the same stealth
+// hop, stealth/union-alpha; the reasoning roles (plan, advisor, slow)
+// skip the remaining free group and fall straight to a paid
+// deepseek-v4.1-flash anchor. The first 2xx response is streamed to the
+// caller; any transient failure (400/401/403/404/429) advances to the
+// next entry.
 //
 // This keeps the role policy in one place (here + the compiled-in
 // ladders below) and lets omp reference roles by a single stable
@@ -24,8 +28,9 @@ import (
 )
 
 // Family names — must match Upstream.Type values in proxy config:
-// opencode-go (paid subscription via OPENCODE_GO_KEY_N) — the funded paid
-// primary that most ladders lead with; opencode-zen (free rows only) — no
+// opencode-go (paid subscription via OPENCODE_GO_KEY_N) — a paid row: it
+// closes the free group of every non-reasoning role and is the anchor row
+// of the reasoning roles; opencode-zen (free rows only) — no
 // ladder references it now, because the zen keys are the same credentials
 // as the go keys and the free tier is 403-gated server-side; minimax (sub
 // MINIMAX_CODING_PLAN_KEY/MINIMAX_KEY, expires 2026-09-09) — its keys are
@@ -112,27 +117,40 @@ func IsSyntheticModel(model string) bool {
 	}
 	return false
 }
+
+// Every role ladder is free-first and opens with the same stealth hop:
+// stealth/union-alpha. It has no ":free" suffix, but it is free upstream
+// (pricing 0/0), so it is the default first attempt for all 10 roles.
+//
+// Non-reasoning roles run their free OpenRouter rows after union-alpha and
+// before any paid row. Reasoning roles (plan, advisor, slow) skip the free
+// group by design: union-alpha is followed by a paid deepseek-v4.1-flash
+// anchor. Each role keeps its existing rows and relative order inside the
+// free and paid groups, including its role-specific paid fallbacks.
 func ladderDefault() []Target {
 	return []Target{
-		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
-		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
+		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-pro"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
 		{FamOpenrouter, "dots-studio/dots-3-note-preview:free", "free-note"},
+		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
+		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
 		{FamMinimax, "MiniMax-M3", "paid-minimax-sub"},
 		{FamMinimax, "MiniMax-M2.7", "paid-minimax-mid"},
 		{FamOpenrouter, "openrouter/pareto-code", "terminal-router"},
 	}
 }
 
-// ladderSmol leads with the free tier and ends on the funded paid primary.
+// ladderSmol leads with union-alpha and its free tier, then falls through the
+// paid tail and ends on the funded paid primary.
 //
 // Every free row below was verified to serve on 2026-09-15 by reading the
 // `model` field out of the response body (a bare 200 is not evidence —
 // forward.go substitutes models silently). Order is static on purpose:
 // free pools flip between 200 and 429 within the hour, so availability
-// must not be encoded here. The trailing go entry is what keeps the role
-// from hard-failing while the paid path is healthy.
+// must not be encoded here. Paid rows follow the free group in their
+// existing order; the trailing go entry is what keeps the role from
+// hard-failing while the paid path is healthy.
 //
 // No openrouter/pareto-code row: it is a PAID OR router, this account has no
 // OR credit and will not get any, and OR 402s it on any request whose
@@ -142,6 +160,7 @@ func ladderDefault() []Target {
 // funded go subscription, which is what the last row is.
 func ladderSmol() []Target {
 	return []Target{
+		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "nvidia/nemotron-3.5-lightning:free", "free-fast"},
 		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-pro"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
@@ -152,12 +171,14 @@ func ladderSmol() []Target {
 	}
 }
 
+// Reasoning role: union-alpha is the free hop, everything after it is paid.
+// The free OR group is deliberately absent so a reasoning request lands on
+// the paid deepseek-v4.1-flash anchor instead of a small free model.
 func ladderSlow() []Target {
 	return []Target{
-		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
+		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
+		{FamOpencodeGo, "deepseek-v4.1-flash", "paid-deepseek-reasoning"},
 		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
-		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-reasoning"},
-		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
 		{FamMinimax, "MiniMax-M3", "paid-minimax-top"},
 		{FamMinimax, "MiniMax-M2.7", "paid-minimax-mid"},
 		{FamOpenrouter, "openrouter/pareto-code", "terminal-router"},
@@ -165,23 +186,25 @@ func ladderSlow() []Target {
 }
 func ladderVision() []Target {
 	return []Target{
-		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
-		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
+		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "google/gemma-4-31b-it:free", "free-vision"},
 		{FamOpenrouter, "google/gemma-4-26b-a4b-it:free", "free-vision-alt"},
 		{FamOpenrouter, "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "free-omni"},
+		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
+		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
 		// No minimax sub vision tier; OR auto-router is the paid
 		// fallback for image tasks.
 		{FamOpenrouter, "openrouter/pareto-code", "terminal-router"},
 	}
 }
 
+// Reasoning role: see ladderSlow — union-alpha then the paid anchor, no free
+// OR group.
 func ladderPlan() []Target {
 	return []Target{
-		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
+		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
+		{FamOpencodeGo, "deepseek-v4.1-flash", "paid-deepseek-reasoning"},
 		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
-		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-pro"},
-		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
 		{FamMinimax, "MiniMax-M3", "paid-minimax-top"},
 		{FamMinimax, "MiniMax-M2.7", "paid-minimax-mid"},
 		{FamOpenrouter, "openrouter/pareto-code", "terminal-router"},
@@ -190,22 +213,24 @@ func ladderPlan() []Target {
 
 func ladderDesigner() []Target {
 	return []Target{
-		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
-		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
+		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "google/gemma-4-31b-it:free", "free-vision"},
 		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-pro"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
+		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
+		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
 		// No minimax sub vision; OR router handles paid design work.
 		{FamOpenrouter, "openrouter/pareto-code", "terminal-router"},
 	}
 }
 func ladderCommit() []Target {
 	return []Target{
-		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
-		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
+		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
 		{FamOpenrouter, "poolside/laguna-xs-2.1:free", "free-swe-small"},
 		{FamOpenrouter, "dots-studio/dots-3-note-preview:free", "free-format"},
+		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
+		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
 		{FamMinimax, "MiniMax-M2.7", "paid-minimax-mid"},
 		{FamOpenrouter, "openrouter/pareto-code", "terminal-router"},
 	}
@@ -213,42 +238,39 @@ func ladderCommit() []Target {
 
 func ladderTiny() []Target {
 	return []Target{
-		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
-		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
+		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "liquid/lfm-2.5-2.6b:free", "free-tiny"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-tiny-coder"},
 		{FamOpenrouter, "dots-studio/dots-3-note-preview:free", "free-tiny-general"},
 		{FamOpenrouter, "google/gemma-4-26b-a4b-it:free", "free-tiny-vision"},
+		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
+		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
+		// Cheapest router stays the terminal row for this role.
 		{FamOpenrouter, "openrouter/free", "terminal-cheapest-router"},
 	}
 }
 
 func ladderTask() []Target {
 	return []Target{
-		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
-		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
+		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-pro"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
+		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
+		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
 		{FamMinimax, "MiniMax-M3", "paid-minimax-top"},
 		{FamMinimax, "MiniMax-M2.7", "paid-minimax-mid"},
 		{FamOpenrouter, "openrouter/pareto-code", "terminal-router"},
 	}
 }
 
+// Reasoning role: see ladderSlow — union-alpha then the paid anchor, no free
+// OR group. It keeps its two OR routers as the paid tail; diversity vs.
+// default (paid-minimax anchor) still comes from a different paid provider.
 func ladderAdvisor() []Target {
 	return []Target{
-		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
+		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
+		{FamOpencodeGo, "deepseek-v4.1-flash", "paid-deepseek-reasoning"},
 		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
-		// The free anchor is a "pro"-tier model rather than one of the
-		// small alts: bigger models follow the read-only advisor tool
-		// schema cleanly (no spurious bash calls), which the previous
-		// small free entries produced as "tool bash quarantined" errors
-		// on the advisor transcript.
-		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-pro"},
-		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
-		{FamOpenrouter, "dots-studio/dots-3-note-preview:free", "free-note"},
-		// Diversity vs. default (paid-minimax anchor); OR routers
-		// provide a different paid provider.
 		{FamOpenrouter, "openrouter/pareto-code", "terminal-router"},
 		{FamOpenrouter, "openrouter/auto-beta", "terminal-router-strong"},
 	}

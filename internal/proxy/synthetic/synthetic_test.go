@@ -6,7 +6,13 @@ import (
 )
 
 // TestAllRolesCovered — every role in AllRoles must have a non-empty
-// ladder (otherwise omp models would be silently useless on a hit).
+// ladder (otherwise omp models would be silently useless on a hit), and
+// every ladder must end on a paid row. The default terminal is an
+// openrouter router; smol is the one exempt role, because the user made it
+// free-first and a drained free pool must not have the last word — its
+// terminal is the funded go primary instead. Both terminals are asserted
+// positionally: "a go row exists somewhere" would stay green if someone
+// appended a row after it.
 func TestAllRolesCovered(t *testing.T) {
 	for _, role := range AllRoles {
 		t.Run(role, func(t *testing.T) {
@@ -14,12 +20,6 @@ func TestAllRolesCovered(t *testing.T) {
 			if len(ladder) == 0 {
 				t.Fatalf("role %q returned empty ladder", role)
 			}
-			// Last entry must be a terminal router. smol is the one
-			// exempt role: it is free-first, so its LAST row must be the
-			// funded paid primary instead — a free tier must not have the
-			// last word, or a drained pool hard-fails the role. Asserted
-			// positionally: "a go row exists somewhere" would stay green
-			// if someone appended a row after it.
 			last := ladder[len(ladder)-1]
 			if role == RoleSmol {
 				if last.Family != FamOpencodeGo || last.Model != "deepseek-v4.1-flash" {
@@ -28,8 +28,11 @@ func TestAllRolesCovered(t *testing.T) {
 				}
 				return
 			}
-			if !strings.HasPrefix(last.Model, "openrouter/") {
-				t.Errorf("role %q terminal %q is not an openrouter router",
+			// The model prefix alone would accept an "openrouter/..." id
+			// routed through a family that cannot serve it, so the family
+			// is pinned too.
+			if last.Family != FamOpenrouter || !strings.HasPrefix(last.Model, "openrouter/") {
+				t.Errorf("role %q terminal %s is not an openrouter router",
 					role, formatTarget(last))
 			}
 		})
@@ -53,25 +56,63 @@ func TestNoZenRows(t *testing.T) {
 	}
 }
 
-// TestOpencodeGoPrimaryExceptSmol — opencode-go is the funded paid-primary
-// family: every ladder except smol must lead with the deepseek primary and
-// the glm fallback. smol is exempt by design (the user made it free-first);
-// the paid row it must keep instead is asserted as its terminal in
-// TestAllRolesCovered.
-func TestOpencodeGoPrimaryExceptSmol(t *testing.T) {
+// reasoningRoles are the three roles whose ladder must buy reasoning
+// capacity instead of borrowing it from the free tier.
+var reasoningRoles = map[string]bool{RolePlan: true, RoleAdvisor: true, RoleSlow: true}
+
+// TestStealthPrimaryForEveryRole — all 10 ladders lead with the openrouter
+// stealth model, and what follows it splits by role. The stealth row is
+// free-of-charge upstream (pricing 0/0, hence no ":free" suffix), so
+// position 0 costs nothing when it serves and the rows below it exist for
+// when it does not. Asserted positionally, not by membership: a ladder that
+// pushed the stealth row behind a paid row would still "contain" it.
+func TestStealthPrimaryForEveryRole(t *testing.T) {
 	for _, role := range AllRoles {
-		if role == RoleSmol {
-			continue
-		}
 		ladder := Cached(role)
 		if len(ladder) < 2 {
 			t.Fatalf("role %q ladder has %d entries, want >=2", role, len(ladder))
 		}
-		if got := ladder[0]; got.Family != FamOpencodeGo || got.Model != "deepseek-v4.1-flash" {
-			t.Errorf("role %q primary = %s, want opencode-go:deepseek-v4.1-flash", role, formatTarget(got))
+		if got := ladder[0]; got.Family != FamOpenrouter || got.Model != "stealth/union-alpha" {
+			t.Errorf("role %q primary = %s, want openrouter:stealth/union-alpha",
+				role, formatTarget(got))
 		}
-		if got := ladder[1]; got.Family != FamOpencodeGo || got.Model != "glm-5.3-flash" {
-			t.Errorf("role %q fallback = %s, want opencode-go:glm-5.3-flash", role, formatTarget(got))
+		second := ladder[1]
+		if reasoningRoles[role] {
+			// Reasoning roles pay for their second attempt: the funded go
+			// primary follows the stealth row directly.
+			if second.Family != FamOpencodeGo || second.Model != "deepseek-v4.1-flash" {
+				t.Errorf("role %q step 2 = %s, want opencode-go:deepseek-v4.1-flash",
+					role, formatTarget(second))
+			}
+			continue
+		}
+		// Every other role keeps its free group directly behind the stealth
+		// row. A go row here would mean the paid group had been moved ahead
+		// of the free tier — the inversion the free-first ordering exists
+		// to prevent.
+		if second.Family == FamOpencodeGo || !isFreeRow(second) {
+			t.Errorf("role %q step 2 = %s, want a free row: the paid group must follow the free group",
+				role, formatTarget(second))
+		}
+	}
+}
+
+// TestReasoningRolesHaveNoFreeRows — plan, advisor and slow must carry no
+// free row at all. These are the token-heaviest roles and the free tier is
+// served by a single openrouter key, so a free row here is a guaranteed
+// wasted round-trip before the paid path is reached — and, mid-plan, a
+// silent downgrade of the role to a small free model. Both free shapes are
+// covered: the ":free" suffix and the openrouter/free router.
+func TestReasoningRolesHaveNoFreeRows(t *testing.T) {
+	for _, role := range AllRoles {
+		if !reasoningRoles[role] {
+			continue
+		}
+		for i, entry := range Cached(role) {
+			if isFreeRow(entry) {
+				t.Errorf("role %q step %d is a free row (%s); reasoning roles stay on paid rows",
+					role, i+1, formatTarget(entry))
+			}
 		}
 	}
 }
@@ -115,8 +156,9 @@ func TestFamilyVariety(t *testing.T) {
 
 // TestMinimaxPaidAnchor — roles that called for a paid minimax anchor
 // (default, plan, task) must include at least one `FamMinimax` row before
-// the terminal router. smol is no longer in this list: it is free-first by
-// user decision, and its paid anchor is opencode-go.
+// the terminal router. smol is not in this list: it is free-first by user
+// decision, and the paid anchor it keeps is its terminal go primary
+// (TestAllRolesCovered).
 func TestMinimaxPaidAnchor(t *testing.T) {
 	needs := []string{RoleDefault, RolePlan, RoleTask}
 	for _, role := range needs {
@@ -178,6 +220,12 @@ func TestMinimaxPaidAnchor(t *testing.T) {
 // flapping pool, not a retired slug — it sits at the tail of ladderSmol()
 // where a flap costs one fast advance and nothing else.
 //
+// stealth/union-alpha is deliberately absent from the set: it is the one
+// free-of-charge row with no ":free" suffix (stealth pricing is 0/0
+// upstream), and it stands at position 0 of all 10 ladders, so listing it
+// would retire every role's first attempt at once. The positional check at
+// the end of this test keeps that out of the list by accident.
+//
 // Raw (non-synthetic) requests for a retired slug are rescued upstream of
 // this: forward.go rewrites the model to openrouter/free and retries on the
 // same key, so a bare 200 there proves nothing unless the body's model equals
@@ -198,6 +246,16 @@ func TestNoDeadFreeIDs(t *testing.T) {
 			if dead[entry.Model] {
 				t.Errorf("role %q step %d uses unservable free id %s", role, i+1, formatTarget(entry))
 			}
+		}
+	}
+	// The stealth primary is the one free-of-charge row without a ":free"
+	// suffix, so it is exactly the row a suffix-keyed edit of the set above
+	// could retire silently — and at position 0 it takes every role's first
+	// attempt down with it. Assert its liveness where the list is curated.
+	for _, role := range AllRoles {
+		if primary := Cached(role)[0]; dead[primary.Model] {
+			t.Errorf("role %q primary %s is classified dead but stands at position 0",
+				role, formatTarget(primary))
 		}
 	}
 }
@@ -269,4 +327,13 @@ func TestResolveUnknownRole(t *testing.T) {
 // formatTarget renders a Target for stable error messages.
 func formatTarget(t Target) string {
 	return t.Family + ":" + t.Model
+}
+
+// isFreeRow reports whether a ladder step is drawn from the free tier: the
+// ":free"-suffixed openrouter slugs and the openrouter/free router.
+func isFreeRow(t Target) bool {
+	if t.Family != FamOpenrouter {
+		return false
+	}
+	return strings.HasSuffix(t.Model, ":free") || t.Model == "openrouter/free"
 }
