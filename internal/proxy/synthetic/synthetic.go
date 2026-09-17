@@ -118,15 +118,7 @@ func IsSyntheticModel(model string) bool {
 	return false
 }
 
-// Every role ladder is free-first and opens with the same stealth hop:
-// stealth/union-alpha. It has no ":free" suffix, but it is free upstream
-// (pricing 0/0), so it is the default first attempt for all 10 roles.
-//
-// Non-reasoning roles run their free OpenRouter rows after union-alpha and
-// before any paid row. Reasoning roles (plan, advisor, slow) skip the free
-// group by design: union-alpha is followed by a paid deepseek-v4.1-flash
-// anchor. Each role keeps its existing rows and relative order inside the
-// free and paid groups, including its role-specific paid fallbacks.
+// Union Alpha has no ":free" suffix but is free upstream (pricing 0/0).
 func ladderDefault() []Target {
 	return []Target{
 		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
@@ -141,10 +133,7 @@ func ladderDefault() []Target {
 	}
 }
 
-// ladderSmol leads with union-alpha and its free tier, then falls through the
-// paid tail and ends on the funded paid primary.
-//
-// Every free row below was verified to serve on 2026-09-15 by reading the
+// Free rows other than Union Alpha were verified on 2026-09-15 by reading the
 // `model` field out of the response body (a bare 200 is not evidence —
 // forward.go substitutes models silently). Order is static on purpose:
 // free pools flip between 200 and 429 within the hour, so availability
@@ -171,9 +160,6 @@ func ladderSmol() []Target {
 	}
 }
 
-// Reasoning role: union-alpha is the free hop, everything after it is paid.
-// The free OR group is deliberately absent so a reasoning request lands on
-// the paid deepseek-v4.1-flash anchor instead of a small free model.
 func ladderSlow() []Target {
 	return []Target{
 		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
@@ -198,8 +184,6 @@ func ladderVision() []Target {
 	}
 }
 
-// Reasoning role: see ladderSlow — union-alpha then the paid anchor, no free
-// OR group.
 func ladderPlan() []Target {
 	return []Target{
 		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
@@ -243,10 +227,9 @@ func ladderTiny() []Target {
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-tiny-coder"},
 		{FamOpenrouter, "dots-studio/dots-3-note-preview:free", "free-tiny-general"},
 		{FamOpenrouter, "google/gemma-4-26b-a4b-it:free", "free-tiny-vision"},
+		{FamOpenrouter, "openrouter/free", "free-router"},
 		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
 		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
-		// Cheapest router stays the terminal row for this role.
-		{FamOpenrouter, "openrouter/free", "terminal-cheapest-router"},
 	}
 }
 
@@ -263,9 +246,7 @@ func ladderTask() []Target {
 	}
 }
 
-// Reasoning role: see ladderSlow — union-alpha then the paid anchor, no free
-// OR group. It keeps its two OR routers as the paid tail; diversity vs.
-// default (paid-minimax anchor) still comes from a different paid provider.
+// Advisor retains two paid OR routers for provider diversity.
 func ladderAdvisor() []Target {
 	return []Target{
 		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
