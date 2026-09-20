@@ -23,6 +23,7 @@ import (
 	"os"
 
 	"llm-proxy/internal/proxy"
+	"llm-proxy/internal/proxy/synthetic"
 )
 
 func main() {
@@ -32,6 +33,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("llm-proxy: %v", err)
 	}
+
+	// Read the synthetic ladder override now rather than on the first
+	// synthetic request, so the load outcome is in the journal from boot.
+	synthetic.EnsureLoaded()
 
 	cfg := proxy.LoadRoutingConfig()
 	addr := cfg.ListenAddr

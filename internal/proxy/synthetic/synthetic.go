@@ -191,6 +191,15 @@ func ensureLadders() {
 	})
 }
 
+// EnsureLoaded forces the ladder override to be read once at process start,
+// so the outcome (loaded vs fell back to the compiled-in defaults) is logged
+// at boot instead of lazily on the first synthetic request. Without this a
+// boot with no synthetic traffic logs nothing, and a runtime check cannot
+// tell a loaded file from a silent fallback.
+func EnsureLoaded() {
+	ensureLadders()
+}
+
 // Resolve returns the ladder for a role: the loaded override when one is
 // present, otherwise the compiled-in default. Role name is matched
 // case-insensitively; unknown roles return nil.
