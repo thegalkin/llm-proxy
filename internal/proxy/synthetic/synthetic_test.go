@@ -1,11 +1,33 @@
 package synthetic
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
-// Every role has a paid terminal; smol and tiny end on funded go models.
+// TestMain severs the suite from the developer's runtime config. The loader
+// consults $LLM_PROXY_LADDERS_FILE (default ~/.config/llm-proxy/ladders.json),
+// so without this the assertions about ladder shape would depend on whatever
+// free-fallback state the local file happens to hold — a disabled file
+// collapses designer/tiny to a single family and fails TestFamilyVariety.
+// Tests that need a file install one explicitly via installLaddersFileForTest.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "llm-proxy-hermetic-")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("LLM_PROXY_LADDERS_FILE", filepath.Join(dir, "absent.json"))
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// Every role's ladder ends on a paid row: smol and tiny on funded go
+// models, designer on a free openrouter row as its last resort, the rest
+// on an openrouter router.
 func TestAllRolesCovered(t *testing.T) {
 	for _, role := range AllRoles {
 		t.Run(role, func(t *testing.T) {
@@ -14,7 +36,8 @@ func TestAllRolesCovered(t *testing.T) {
 				t.Fatalf("role %q returned empty ladder", role)
 			}
 			last := ladder[len(ladder)-1]
-			if role == RoleSmol || role == RoleTiny {
+			switch role {
+			case RoleSmol, RoleTiny:
 				model := "deepseek-v4.1-flash"
 				if role == RoleTiny {
 					model = "glm-5.3-flash"
@@ -23,14 +46,21 @@ func TestAllRolesCovered(t *testing.T) {
 					t.Errorf("role %q terminal = %s, want opencode-go:%s",
 						role, formatTarget(last), model)
 				}
-				return
-			}
-			// The model prefix alone would accept an "openrouter/..." id
-			// routed through a family that cannot serve it, so the family
-			// is pinned too.
-			if last.Family != FamOpenrouter || !strings.HasPrefix(last.Model, "openrouter/") {
-				t.Errorf("role %q terminal %s is not an openrouter router",
-					role, formatTarget(last))
+			case RoleDesigner:
+				// designer has no openrouter router row; its ladder ends
+				// on the free openrouter rows.
+				if last.Family != FamOpenrouter || !isFreeRow(last) {
+					t.Errorf("role %q terminal %s is not a free openrouter row",
+						role, formatTarget(last))
+				}
+			default:
+				// The model prefix alone would accept an "openrouter/..." id
+				// routed through a family that cannot serve it, so the family
+				// is pinned too.
+				if last.Family != FamOpenrouter || !strings.HasPrefix(last.Model, "openrouter/") {
+					t.Errorf("role %q terminal %s is not an openrouter router",
+						role, formatTarget(last))
+				}
 			}
 		})
 	}
@@ -57,31 +87,29 @@ func TestNoZenRows(t *testing.T) {
 // capacity instead of borrowing it from the free tier.
 var reasoningRoles = map[string]bool{RolePlan: true, RoleAdvisor: true, RoleSlow: true}
 
-// TestStealthPrimaryForEveryRole — all 10 ladders lead with the openrouter
-// stealth model, and what follows it splits by role. The stealth row is
-// free-of-charge upstream (pricing 0/0, hence no ":free" suffix), so
-// position 0 costs nothing when it serves and the rows below it exist for
-// when it does not. Asserted positionally, not by membership: a ladder that
-// pushed the stealth row behind a paid row would still "contain" it.
-func TestStealthPrimaryForEveryRole(t *testing.T) {
+// TestFreeFirstForEveryRole — ladders lead with a free openrouter row,
+// except the reasoning roles and designer, which lead with the funded go
+// primary. Asserted positionally, not by membership: a ladder that pushed
+// the free row behind a paid row would still "contain" it.
+func TestFreeFirstForEveryRole(t *testing.T) {
+	// paidFirst are the roles whose first attempt is a paid go row.
+	paidFirst := map[string]bool{RolePlan: true, RoleAdvisor: true, RoleSlow: true, RoleDesigner: true}
 	for _, role := range AllRoles {
 		ladder := Cached(role)
 		if len(ladder) < 2 {
 			t.Fatalf("role %q ladder has %d entries, want >=2", role, len(ladder))
 		}
-		if got := ladder[0]; got.Family != FamOpenrouter || got.Model != "stealth/union-alpha" {
-			t.Errorf("role %q primary = %s, want openrouter:stealth/union-alpha",
-				role, formatTarget(got))
-		}
-		second := ladder[1]
-		if reasoningRoles[role] {
-			// Reasoning roles pay for their second attempt: the funded go
-			// primary follows the stealth row directly.
-			if second.Family != FamOpencodeGo || second.Model != "deepseek-v4.1-flash" {
-				t.Errorf("role %q step 2 = %s, want opencode-go:deepseek-v4.1-flash",
-					role, formatTarget(second))
+		first := ladder[0]
+		if paidFirst[role] {
+			if first.Family != FamOpencodeGo || first.Model != "deepseek-v4.1-flash" {
+				t.Errorf("role %q primary = %s, want opencode-go:deepseek-v4.1-flash",
+					role, formatTarget(first))
 			}
 			continue
+		}
+		if !isFreeRow(first) {
+			t.Errorf("role %q primary = %s, want a free openrouter row",
+				role, formatTarget(first))
 		}
 		paidSeen := false
 		for i, entry := range ladder {
@@ -96,7 +124,7 @@ func TestStealthPrimaryForEveryRole(t *testing.T) {
 	}
 }
 
-// Reasoning roles skip every free alternative after the stealth primary.
+// Reasoning roles skip every free alternative after their paid primary.
 func TestReasoningRolesHaveNoFreeRows(t *testing.T) {
 	for _, role := range AllRoles {
 		if !reasoningRoles[role] {
@@ -300,6 +328,82 @@ func TestResolveUnknownRole(t *testing.T) {
 	}
 }
 
+// TestLaddersFileOverride — a readable override file replaces the
+// compiled-in ladder for the roles it names, while roles it omits keep
+// the default.
+func TestLaddersFileOverride(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ladders.json")
+	src := `{"version":1,"free_fallback":true,"roles":{"slow":[{"family":"openrouter","model":"nex-agi/nex-n2.5-pro:free","reason":"free-pro"}]}}`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installLaddersFileForTest(t, path)
+
+	got := Resolve("slow")
+	want := []Target{{Family: FamOpenrouter, Model: "nex-agi/nex-n2.5-pro:free", Reason: "free-pro"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("Resolve(slow) = %v, want %v", got, want)
+	}
+	// A role the file omits still falls back to the compiled-in ladder.
+	def := Resolve(RoleDefault)
+	if len(def) != len(ladderDefault()) || def[0] != ladderDefault()[0] {
+		t.Errorf("Resolve(default) = %v, want compiled-in default %v", def, ladderDefault())
+	}
+}
+
+// TestLaddersFileMalformedFallsBack — a malformed file must not break
+// resolution: every known role returns its compiled-in ladder.
+func TestLaddersFileMalformedFallsBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ladders.json")
+	if err := os.WriteFile(path, []byte(`{"roles":`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installLaddersFileForTest(t, path)
+
+	for _, role := range AllRoles {
+		got := Resolve(role)
+		if len(got) == 0 {
+			t.Fatalf("role %q returned empty ladder after malformed file", role)
+		}
+	}
+}
+
+// TestLaddersFileUnknownFamilyFallsBack — an unknown family string is a
+// load error, so the whole file is rejected and defaults win.
+func TestLaddersFileUnknownFamilyFallsBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ladders.json")
+	src := `{"version":1,"free_fallback":true,"roles":{"slow":[{"family":"acme","model":"x","reason":"y"}]}}`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installLaddersFileForTest(t, path)
+
+	got := Resolve("slow")
+	if len(got) != len(ladderSlow()) || got[0] != ladderSlow()[0] {
+		t.Fatalf("Resolve(slow) = %v, want compiled-in default %v", got, ladderSlow())
+	}
+}
+
+// installLaddersFileForTest points the loader at path under a fresh
+// sync.Once so each test observes its own load. The previous state is
+// restored on cleanup.
+func installLaddersFileForTest(t *testing.T, path string) {
+	t.Helper()
+	t.Setenv("LLM_PROXY_LADDERS_FILE", path)
+	laddersOnce = sync.Once{}
+	loadedLadders = nil
+	cacheMu.Lock()
+	cache = map[string][]Target{}
+	cacheMu.Unlock()
+	t.Cleanup(func() {
+		laddersOnce = sync.Once{}
+		loadedLadders = nil
+		cacheMu.Lock()
+		cache = map[string][]Target{}
+		cacheMu.Unlock()
+	})
+}
+
 // --- helpers ---
 
 // formatTarget renders a Target for stable error messages.
@@ -307,10 +411,11 @@ func formatTarget(t Target) string {
 	return t.Family + ":" + t.Model
 }
 
-// isFreeRow includes the zero-priced stealth model despite its unsuffixed ID.
+// isFreeRow reports whether a row is a free openrouter row: a ":free"
+// suffixed model, or the openrouter/free router.
 func isFreeRow(t Target) bool {
 	if t.Family != FamOpenrouter {
 		return false
 	}
-	return strings.HasSuffix(t.Model, ":free") || t.Model == "openrouter/free" || t.Model == "stealth/union-alpha"
+	return strings.HasSuffix(t.Model, ":free") || t.Model == "openrouter/free"
 }

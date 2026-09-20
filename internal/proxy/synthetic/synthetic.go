@@ -2,16 +2,20 @@
 // llm-proxy. Instead of binding omp to a single model per role, the
 // proxy exposes 10 synthetic model IDs (`synthetic/<role>`) and runs
 // a per-role ordered ladder of upstream attempts whenever one is
-// requested. Every ladder is free-first and opens with the same stealth
-// hop, stealth/union-alpha; the reasoning roles (plan, advisor, slow)
-// skip the remaining free group and fall straight to a paid
-// deepseek-v4.1-flash anchor. The first 2xx response is streamed to the
-// caller; any transient failure (400/401/403/404/429) advances to the
-// next entry.
+// requested. Every ladder is free-first; the reasoning roles (plan,
+// advisor, slow) skip the remaining free group and fall straight to a
+// paid deepseek-v4.1-flash anchor. The first 2xx response is streamed
+// to the caller; any transient failure (400/401/403/404/429) advances
+// to the next entry.
 //
-// This keeps the role policy in one place (here + the compiled-in
-// ladders below) and lets omp reference roles by a single stable
-// model ID without exposing internal failover chains in
+// The compiled-in ladders below are the single source of truth for role
+// policy. A JSON file may override them at process start
+// ($LLM_PROXY_LADDERS_FILE, else $HOME/.config/llm-proxy/ladders.json);
+// that shipped file is generated from these same ladders, so a fresh
+// checkout with no file behaves identically to one with it.
+//
+// This keeps the role policy in one place and lets omp reference roles by a
+// single stable model ID without exposing internal failover chains in
 // ~/.omp/agent/config.yml.
 //
 // The package is decoupled from the rest of the proxy by emitting
@@ -22,6 +26,10 @@
 package synthetic
 
 import (
+	"encoding/json"
+	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -73,10 +81,128 @@ type Target struct {
 	Reason string
 }
 
-// Resolve returns the static ladder for a role. Role name is matched
+// --- JSON ladder file ---
+
+// laddersFilePath is the override file consulted once at process start.
+// LLM_PROXY_LADDERS_FILE wins (a literal path, "~" expanded); the default
+// is $HOME/.config/llm-proxy/ladders.json. Tests point it at a fixture and
+// reset loadedLadders.
+func laddersFilePath() string {
+	p := os.Getenv("LLM_PROXY_LADDERS_FILE")
+	if p == "" {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return ""
+		}
+		return filepath.Join(home, ".config", "llm-proxy", "ladders.json")
+	}
+	if p == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+	}
+	if strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
+}
+
+// ladderFileSchema is the on-disk shape. version and free_fallback are
+// informational; roles is what the loader consumes.
+type ladderFileSchema struct {
+	Version      int                              `json:"version"`
+	FreeFallback bool                             `json:"free_fallback"`
+	Roles        map[string][]ladderFileRoleEntry `json:"roles"`
+}
+
+type ladderFileRoleEntry struct {
+	Family string `json:"family"`
+	Model  string `json:"model"`
+	Reason string `json:"reason"`
+}
+
+// familyByName maps the JSON family string to the proxy family constant.
+func familyByName(name string) (string, bool) {
+	switch name {
+	case FamOpencodeZen:
+		return FamOpencodeZen, true
+	case FamOpencodeGo:
+		return FamOpencodeGo, true
+	case FamMinimax:
+		return FamMinimax, true
+	case FamOpenrouter:
+		return FamOpenrouter, true
+	case FamOllama:
+		return FamOllama, true
+	}
+	return "", false
+}
+
+var (
+	laddersOnce   sync.Once
+	loadedLadders map[string][]Target
+)
+
+// ensureLadders loads the override file exactly once. Any problem
+// (missing, unreadable, malformed, unknown family, empty ladder) leaves
+// loadedLadders nil so Resolve falls back to the compiled-in defaults; a
+// file problem is logged, never fatal.
+func ensureLadders() {
+	laddersOnce.Do(func() {
+		path := laddersFilePath()
+		if path == "" {
+			return
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			log.Printf("ERROR synthetic: ladders file %s not readable (%v); using compiled-in default ladders", path, err)
+			return
+		}
+		var doc ladderFileSchema
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			log.Printf("ERROR synthetic: ladders file %s malformed (%v); using compiled-in default ladders", path, err)
+			return
+		}
+		if len(doc.Roles) == 0 {
+			log.Printf("ERROR synthetic: ladders file %s has no roles; using compiled-in default ladders", path)
+			return
+		}
+		loaded := make(map[string][]Target, len(doc.Roles))
+		for role, entries := range doc.Roles {
+			if len(entries) == 0 {
+				log.Printf("ERROR synthetic: ladders file %s role %q is empty; using compiled-in default ladders", path, role)
+				return
+			}
+			ladder := make([]Target, 0, len(entries))
+			for _, e := range entries {
+				fam, ok := familyByName(e.Family)
+				if !ok {
+					log.Printf("ERROR synthetic: ladders file %s role %q has unknown family %q; using compiled-in default ladders", path, role, e.Family)
+					return
+				}
+				ladder = append(ladder, Target{Family: fam, Model: e.Model, Reason: e.Reason})
+			}
+			loaded[strings.ToLower(strings.TrimSpace(role))] = ladder
+		}
+		loadedLadders = loaded
+		log.Printf("synthetic: ladders loaded from %s: %d roles free_fallback=%v", path, len(loaded), doc.FreeFallback)
+	})
+}
+
+// Resolve returns the ladder for a role: the loaded override when one is
+// present, otherwise the compiled-in default. Role name is matched
 // case-insensitively; unknown roles return nil.
 func Resolve(role string) []Target {
-	switch strings.ToLower(strings.TrimSpace(role)) {
+	key := strings.ToLower(strings.TrimSpace(role))
+	ensureLadders()
+	if loadedLadders != nil {
+		if ladder, ok := loadedLadders[key]; ok {
+			return ladder
+		}
+	}
+	switch key {
 	case RoleDefault:
 		return ladderDefault()
 	case RoleSmol:
@@ -118,10 +244,11 @@ func IsSyntheticModel(model string) bool {
 	return false
 }
 
-// Union Alpha has no ":free" suffix but is free upstream (pricing 0/0).
+// The compiled-in ladders below are the single source of truth: the
+// shipped ~/.config/llm-proxy/ladders.json is generated from them, so
+// editing one without the other diverges the two.
 func ladderDefault() []Target {
 	return []Target{
-		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-pro"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
 		{FamOpenrouter, "dots-studio/dots-3-note-preview:free", "free-note"},
@@ -133,7 +260,7 @@ func ladderDefault() []Target {
 	}
 }
 
-// Free rows other than Union Alpha were verified on 2026-09-15 by reading the
+// Free rows were verified on 2026-09-15 by reading the
 // `model` field out of the response body (a bare 200 is not evidence —
 // forward.go substitutes models silently). Order is static on purpose:
 // free pools flip between 200 and 429 within the hour, so availability
@@ -149,7 +276,6 @@ func ladderDefault() []Target {
 // funded go subscription, which is what the last row is.
 func ladderSmol() []Target {
 	return []Target{
-		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "nvidia/nemotron-3.5-lightning:free", "free-fast"},
 		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-pro"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
@@ -162,7 +288,6 @@ func ladderSmol() []Target {
 
 func ladderSlow() []Target {
 	return []Target{
-		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpencodeGo, "deepseek-v4.1-flash", "paid-deepseek-reasoning"},
 		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
 		{FamMinimax, "MiniMax-M3", "paid-minimax-top"},
@@ -172,7 +297,6 @@ func ladderSlow() []Target {
 }
 func ladderVision() []Target {
 	return []Target{
-		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "google/gemma-4-31b-it:free", "free-vision"},
 		{FamOpenrouter, "google/gemma-4-26b-a4b-it:free", "free-vision-alt"},
 		{FamOpenrouter, "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "free-omni"},
@@ -186,7 +310,6 @@ func ladderVision() []Target {
 
 func ladderPlan() []Target {
 	return []Target{
-		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpencodeGo, "deepseek-v4.1-flash", "paid-deepseek-reasoning"},
 		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
 		{FamMinimax, "MiniMax-M3", "paid-minimax-top"},
@@ -197,19 +320,15 @@ func ladderPlan() []Target {
 
 func ladderDesigner() []Target {
 	return []Target{
-		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
+		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
+		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
 		{FamOpenrouter, "google/gemma-4-31b-it:free", "free-vision"},
 		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-pro"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
-		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
-		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
-		// No minimax sub vision; OR router handles paid design work.
-		{FamOpenrouter, "openrouter/pareto-code", "terminal-router"},
 	}
 }
 func ladderCommit() []Target {
 	return []Target{
-		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
 		{FamOpenrouter, "poolside/laguna-xs-2.1:free", "free-swe-small"},
 		{FamOpenrouter, "dots-studio/dots-3-note-preview:free", "free-format"},
@@ -222,7 +341,6 @@ func ladderCommit() []Target {
 
 func ladderTiny() []Target {
 	return []Target{
-		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "liquid/lfm-2.5-2.6b:free", "free-tiny"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-tiny-coder"},
 		{FamOpenrouter, "dots-studio/dots-3-note-preview:free", "free-tiny-general"},
@@ -235,7 +353,6 @@ func ladderTiny() []Target {
 
 func ladderTask() []Target {
 	return []Target{
-		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpenrouter, "nex-agi/nex-n2.5-pro:free", "free-pro"},
 		{FamOpenrouter, "cohere/north-mini-code:free", "free-code"},
 		{FamOpencodeGo, "deepseek-v4.1-flash", "go-deepseek-primary"},
@@ -249,7 +366,6 @@ func ladderTask() []Target {
 // Advisor retains two paid OR routers for provider diversity.
 func ladderAdvisor() []Target {
 	return []Target{
-		{FamOpenrouter, "stealth/union-alpha", "free-union-alpha-default"},
 		{FamOpencodeGo, "deepseek-v4.1-flash", "paid-deepseek-reasoning"},
 		{FamOpencodeGo, "glm-5.3-flash", "go-glm-fallback"},
 		{FamOpenrouter, "openrouter/pareto-code", "terminal-router"},
@@ -277,23 +393,24 @@ var (
 )
 
 // Cached returns a stable copy of the ladder for `role`. The first
-// lookup clones the static slice into the cache; subsequent lookups
+// lookup clones the resolved slice into the cache; subsequent lookups
 // return the cached slice (cheap). The returned slice MUST NOT be
 // mutated by callers; defensive copies are not issued because that
 // would defeat the cache.
 func Cached(role string) []Target {
+	key := strings.ToLower(strings.TrimSpace(role))
 	cacheMu.RLock()
-	t, ok := cache[role]
+	t, ok := cache[key]
 	cacheMu.RUnlock()
 	if ok {
 		return t
 	}
-	resolved := Resolve(role)
+	resolved := Resolve(key)
 	if resolved == nil {
 		return nil
 	}
 	cacheMu.Lock()
-	cache[role] = resolved
+	cache[key] = resolved
 	cacheMu.Unlock()
 	return resolved
 }
