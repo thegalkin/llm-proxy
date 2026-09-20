@@ -75,14 +75,26 @@ func ForwardSynthetic(w http.ResponseWriter, r *http.Request, body []byte, model
 }
 
 // failureDetail renders a short, single-line excerpt of an upstream failure
-// body, so a non-2xx attempt is diagnosable from the journal alone. The whole
-// body is deliberately not logged: it can be large, and the already-drained
-// 8 KiB chunk carries everything setCooldown needs.
+// body, so a non-2xx attempt is diagnosable from the journal alone.
 func failureDetail(chunk []byte) string {
 	if len(chunk) == 0 {
 		return ""
 	}
+	// Unwrap a JSON error envelope to its "message": the wrappers around it
+	// ("Error from provider (Console Go): Upstream request failed: ...") are
+	// longer than the rule they introduce, so a raw excerpt reports the
+	// envelope and hides the cause. The whole body is deliberately not
+	// logged: it can be large, and the already-drained 8 KiB chunk carries
+	// everything setCooldown needs.
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
 	s := strings.Join(strings.Fields(string(chunk)), " ")
+	if json.Unmarshal(chunk, &env) == nil && env.Error.Message != "" {
+		s = strings.Join(strings.Fields(env.Error.Message), " ")
+	}
 	if len(s) > 400 {
 		s = s[:400] + "..."
 	}
