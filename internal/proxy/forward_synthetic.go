@@ -74,6 +74,21 @@ func ForwardSynthetic(w http.ResponseWriter, r *http.Request, body []byte, model
 	http.Error(w, "llm-proxy: synthetic ladder exhausted", http.StatusBadGateway)
 }
 
+// failureDetail renders a short, single-line excerpt of an upstream failure
+// body, so a non-2xx attempt is diagnosable from the journal alone. The whole
+// body is deliberately not logged: it can be large, and the already-drained
+// 8 KiB chunk carries everything setCooldown needs.
+func failureDetail(chunk []byte) string {
+	if len(chunk) == 0 {
+		return ""
+	}
+	s := strings.Join(strings.Fields(string(chunk)), " ")
+	if len(s) > 400 {
+		s = s[:400] + "..."
+	}
+	return ", body=" + strconv.Quote(s)
+}
+
 // syntheticAttempt attempts one ladder entry, sweeping the entry's whole
 // provider keyset (cooldown-aware, via buildAttemptOrder) until a key
 // returns 2xx. On 2xx it copies headers + body to w and returns true. A
@@ -129,8 +144,8 @@ func syntheticAttempt(httpClient *http.Client, tr *http.Transport, w http.Respon
 			chunk, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 			_ = resp.Body.Close()
 			setCooldown(p, resp.StatusCode, resp.Header.Get("Retry-After"), chunk)
-			log.Printf("synthetic[%s] attempt %s:%s key=%s status=%d, next key",
-				role, t.Family, t.Model, p.Name, resp.StatusCode)
+			log.Printf("synthetic[%s] attempt %s:%s key=%s status=%d, next key%s",
+				role, t.Family, t.Model, p.Name, resp.StatusCode, failureDetail(chunk))
 			continue
 		}
 
