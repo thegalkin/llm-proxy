@@ -14,6 +14,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -101,6 +102,97 @@ func failureDetail(chunk []byte) string {
 	return ", body=" + strconv.Quote(s)
 }
 
+// requestShape summarises the shape of an outgoing synthetic request body in
+// one bounded line, so a payload upstream rejected (400/403) is identifiable
+// from the journal alone: per message index, role, content size, whether
+// reasoning_content is present and its JSON type/size, the tool_calls count
+// and whether content is empty — plus the top-level byte size, stream flag
+// and tools/messages counts. Only the first 40 messages are listed, plus the
+// last one — upstream usually rejects the newest assistant turn, which the
+// head cap would otherwise hide. No message text is ever emitted and the
+// body itself is never logged.
+//
+// The forwarded body is the client's body verbatim (only the model id is
+// rewritten, see rewriteBodyModel), so every field reported here is the
+// client's own.
+func requestShape(body []byte) string {
+	var m struct {
+		Stream   *bool             `json:"stream"`
+		Tools    []json.RawMessage `json:"tools"`
+		Messages []shapeMessage    `json:"messages"`
+	}
+	if json.Unmarshal(body, &m) != nil {
+		return "bytes=" + strconv.Itoa(len(body)) + " not-json"
+	}
+	stream := "absent"
+	if m.Stream != nil {
+		stream = strconv.FormatBool(*m.Stream)
+	}
+	const maxMsgs = 40
+	var b strings.Builder
+	fmt.Fprintf(&b, "bytes=%d stream=%s tools=%d messages=%d msgs=[",
+		len(body), stream, len(m.Tools), len(m.Messages))
+	for i := range m.Messages {
+		if i == maxMsgs {
+			last := len(m.Messages) - 1
+			fmt.Fprintf(&b, " … +%d more, last=%s",
+				len(m.Messages)-maxMsgs, m.Messages[last].shape(last))
+			break
+		}
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(m.Messages[i].shape(i))
+	}
+	b.WriteString("]")
+	return b.String()
+}
+
+// shapeMessage is the per-message slice of a chat-completions body that
+// requestShape reports on.
+type shapeMessage struct {
+	Role             string            `json:"role"`
+	Content          json.RawMessage   `json:"content"`
+	ReasoningContent json.RawMessage   `json:"reasoning_content"`
+	ToolCalls        []json.RawMessage `json:"tool_calls"`
+}
+
+// shape renders one message as "<i>:<role> content=<kind>/<size>
+// rc=<kind>/<size> tool_calls=<n> empty=<bool>" — never the text itself.
+func (m shapeMessage) shape(i int) string {
+	ck, cn := jsonShape(m.Content)
+	rk, rn := jsonShape(m.ReasoningContent)
+	return fmt.Sprintf("%d:%s content=%s/%d rc=%s/%d tool_calls=%d empty=%v",
+		i, m.Role, ck, cn, rk, rn, len(m.ToolCalls), cn == 0)
+}
+
+// jsonShape names a raw JSON value's type and size: decoded character count
+// for strings, element count for arrays, raw byte count otherwise. An absent
+// key and an explicit null are distinguished so the shape line shows which
+// one the client sent.
+func jsonShape(raw json.RawMessage) (string, int) {
+	if len(raw) == 0 {
+		return "absent", 0
+	}
+	switch raw[0] {
+	case '"':
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return "string", len(s)
+		}
+	case '[':
+		var a []json.RawMessage
+		if json.Unmarshal(raw, &a) == nil {
+			return "array", len(a)
+		}
+	case '{':
+		return "object", len(raw)
+	case 'n':
+		return "null", 0
+	}
+	return "other", len(raw)
+}
+
 // syntheticAttempt attempts one ladder entry, sweeping the entry's whole
 // provider keyset (cooldown-aware, via buildAttemptOrder) until a key
 // returns 2xx. On 2xx it copies headers + body to w and returns true. A
@@ -158,6 +250,14 @@ func syntheticAttempt(httpClient *http.Client, tr *http.Transport, w http.Respon
 			setCooldown(p, resp.StatusCode, resp.Header.Get("Retry-After"), chunk)
 			log.Printf("synthetic[%s] attempt %s:%s key=%s status=%d, next key%s",
 				role, t.Family, t.Model, p.Name, resp.StatusCode, failureDetail(chunk))
+			// 400/403 mean upstream rejected the payload itself (429 is
+			// quota noise and already logs a body), so add one bounded
+			// shape line naming the message that carried the rejected
+			// field. sendBody is what was actually sent.
+			if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusForbidden {
+				log.Printf("synthetic[%s] attempt %s:%s key=%s status=%d req-shape: %s",
+					role, t.Family, t.Model, p.Name, resp.StatusCode, requestShape(sendBody))
+			}
 			continue
 		}
 
